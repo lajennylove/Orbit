@@ -6,6 +6,8 @@
 
 mod database;
 mod error;
+mod migrate;
 
 pub use database::Database;
 pub use error::Error;
+pub use migrate::{Migration, Migrator, State, Status};

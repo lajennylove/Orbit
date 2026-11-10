@@ -1,0 +1,1 @@
+ALTER TABLE widgets ADD COLUMN color VARCHAR(32) NULL;
