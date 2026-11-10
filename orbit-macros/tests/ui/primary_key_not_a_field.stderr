@@ -1,0 +1,5 @@
+error: no field maps to the primary key column `uuid`
+ --> tests/ui/primary_key_not_a_field.rs:4:40
+  |
+4 | #[orbit(table = "posts", primary_key = "uuid")]
+  |                                        ^^^^^^

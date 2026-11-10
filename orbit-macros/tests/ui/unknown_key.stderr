@@ -1,0 +1,5 @@
+error: unknown key; a struct takes `table` and `primary_key`
+ --> tests/ui/unknown_key.rs:4:26
+  |
+4 | #[orbit(table = "posts", tabel = "posts")]
+  |                          ^^^^^
