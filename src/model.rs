@@ -8,7 +8,7 @@ pub trait Model: for<'r> FromRow<'r, MySqlRow> + Send + Unpin + Sized {
     /// The table name.
     const TABLE: &'static str;
 
-    /// The primary key, used by `find` and by the default order of `first`.
+    /// The primary key, used by `find`. `first` has no default order, as in Laravel.
     const PRIMARY_KEY: &'static str = "id";
 
     /// The columns that `insert` and `update` may write. Empty by default, as in Laravel's `$fillable`.
