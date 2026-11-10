@@ -60,11 +60,57 @@ let post = Post::query().find_or_fail(&db, 1).await?;
 let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
 ```
 
-Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`. Sorting and paging: `order_by`, `select`, `limit`, `offset`.
+Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`, inside a transaction only.
+
+Conditions are grouped in parentheses with `where_group` and `or_where_group`:
+
+```rust
+let posts = Post::query()
+    .where_op("views", Operator::Ge, 100)
+    .where_group(|q| q.where_eq("title", "Hello").or_where_eq("title", "Hi"))
+    .get(&db)
+    .await?;
+```
 
 Values are always bound as parameters. Table and column names are quoted, and a name that is empty or contains a backtick is an error.
 
 `insert` and `update` accept only columns listed in `FILLABLE`. Any other column returns `Error::NotFillable`.
+
+## Transactions
+
+`transaction` runs a closure in a transaction. It commits when the closure returns `Ok` and rolls back when it returns `Err` or panics. Pass the transaction to queries as `&mut *tx`; a query given `&db` runs outside it.
+
+```rust
+use orbit_orm::{Database, Error, Model};
+
+let id = db
+    .transaction(async |tx| {
+        let id = Post::query()
+            .insert(&mut *tx, &[("title", "Hello".into())])
+            .await?;
+        Post::query().where_eq("id", id).for_update().first_or_fail(&mut *tx).await?;
+        Ok::<_, Error>(id)
+    })
+    .await?;
+```
+
+`for_update` locks the matching rows until the transaction ends. Outside a transaction it returns `Error::LockOutsideTransaction`. `tx.connection()` gives the raw connection for SQL that Orbit does not wrap.
+
+## Errors
+
+Some database errors have their own variants, so they can be matched:
+
+```rust
+match Post::query().insert(&db, &[("title", "Hello".into())]).await {
+    Ok(id) => println!("inserted {id}"),
+    Err(Error::UniqueViolation { index }) => println!("unique index {index:?} was violated"),
+    Err(Error::ForeignKeyViolation { constraint }) => println!("foreign key {constraint:?} was violated"),
+    Err(Error::Deadlock) | Err(Error::LockWaitTimeout) => println!("retry the transaction"),
+    Err(other) => return Err(other),
+}
+```
+
+`UniqueViolation` and `ForeignKeyViolation` carry the index or constraint name when the server reports it. Other errors are `Error::Database`.
 
 ## Migrations
 

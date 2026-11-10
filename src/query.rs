@@ -1,9 +1,11 @@
 use std::marker::PhantomData;
 
 use sqlx::AssertSqlSafe;
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
 
+use crate::transaction::{Executor, Target};
 use crate::value::bind;
-use crate::{Database, Error, Model, Value};
+use crate::{Error, Model, Value};
 
 /// A comparison for `where_op`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,13 @@ pub enum Direction {
     Desc,
 }
 
+/// How a condition joins the one before it. The first condition has no joiner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Joiner {
+    And,
+    Or,
+}
+
 #[derive(Debug, Clone)]
 enum Condition {
     Compare {
@@ -51,17 +60,26 @@ enum Condition {
         column: String,
         negated: bool,
     },
+    /// A parenthesised group, built by `where_group`.
+    Group(Vec<Clause>),
+}
+
+#[derive(Debug, Clone)]
+struct Clause {
+    joiner: Joiner,
+    condition: Condition,
 }
 
 /// A query on one model's table. Start it with `Model::query()` or `Query::table()`, then
 /// finish it with a terminal method such as `get`, `first` or `insert`.
 pub struct Query<M: Model> {
     table: String,
-    conditions: Vec<Condition>,
+    conditions: Vec<Clause>,
     orders: Vec<(String, Direction)>,
     columns: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    lock: bool,
     error: Option<Error>,
     model: PhantomData<M>,
 }
@@ -100,28 +118,49 @@ impl<M: Model> Query<M> {
         let table = quote(M::TABLE, &mut error);
         Self {
             table,
+            error,
+            ..Self::blank()
+        }
+    }
+
+    /// A query with no table, for the conditions of a group.
+    fn blank() -> Self {
+        Self {
+            table: String::new(),
             conditions: Vec::new(),
             orders: Vec::new(),
             columns: None,
             limit: None,
             offset: None,
-            error,
+            lock: false,
+            error: None,
             model: PhantomData,
         }
     }
 
     /// Adds `column = value`. A `NULL` value becomes `IS NULL`, as in Laravel.
     pub fn where_eq(self, column: &str, value: impl Into<Value>) -> Self {
-        self.compare(column, "=", value.into())
+        self.compare(Joiner::And, column, "=", value.into())
+    }
+
+    /// Adds `OR column = value`.
+    pub fn or_where_eq(self, column: &str, value: impl Into<Value>) -> Self {
+        self.compare(Joiner::Or, column, "=", value.into())
     }
 
     /// Adds `column <op> value`. `!=` with a `NULL` value becomes `IS NOT NULL`.
     pub fn where_op(self, column: &str, op: Operator, value: impl Into<Value>) -> Self {
-        self.compare(column, op.sql(), value.into())
+        self.compare(Joiner::And, column, op.sql(), value.into())
     }
 
-    fn compare(mut self, column: &str, op: &'static str, value: Value) -> Self {
-        let column = quote(column, &mut self.error);
+    /// Adds `OR column <op> value`. `!=` with a `NULL` value becomes `IS NOT NULL`.
+    pub fn or_where_op(self, column: &str, op: Operator, value: impl Into<Value>) -> Self {
+        self.compare(Joiner::Or, column, op.sql(), value.into())
+    }
+
+    fn compare(self, joiner: Joiner, column: &str, op: &'static str, value: Value) -> Self {
+        let mut this = self;
+        let column = quote(column, &mut this.error);
         let condition = match (value, op) {
             (Value::Null, "=") => Condition::Null {
                 column,
@@ -133,39 +172,94 @@ impl<M: Model> Query<M> {
             },
             (value, op) => Condition::Compare { column, op, value },
         };
-        self.conditions.push(condition);
-        self
+        this.push(joiner, condition)
     }
 
     /// Adds `column IN (values)`. An empty list matches no rows, as in Laravel.
     pub fn where_in<V: Into<Value>>(
+        self,
+        column: &str,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        self.in_list(Joiner::And, column, values)
+    }
+
+    /// Adds `OR column IN (values)`. An empty list matches no rows.
+    pub fn or_where_in<V: Into<Value>>(
+        self,
+        column: &str,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        self.in_list(Joiner::Or, column, values)
+    }
+
+    fn in_list<V: Into<Value>>(
         mut self,
+        joiner: Joiner,
         column: &str,
         values: impl IntoIterator<Item = V>,
     ) -> Self {
         let column = quote(column, &mut self.error);
         let values = values.into_iter().map(Into::into).collect();
-        self.conditions.push(Condition::In { column, values });
-        self
+        self.push(joiner, Condition::In { column, values })
     }
 
     /// Adds `column IS NULL`.
-    pub fn where_null(mut self, column: &str) -> Self {
-        let column = quote(column, &mut self.error);
-        self.conditions.push(Condition::Null {
-            column,
-            negated: false,
-        });
-        self
+    pub fn where_null(self, column: &str) -> Self {
+        self.null(Joiner::And, column, false)
+    }
+
+    /// Adds `OR column IS NULL`.
+    pub fn or_where_null(self, column: &str) -> Self {
+        self.null(Joiner::Or, column, false)
     }
 
     /// Adds `column IS NOT NULL`.
-    pub fn where_not_null(mut self, column: &str) -> Self {
+    pub fn where_not_null(self, column: &str) -> Self {
+        self.null(Joiner::And, column, true)
+    }
+
+    /// Adds `OR column IS NOT NULL`.
+    pub fn or_where_not_null(self, column: &str) -> Self {
+        self.null(Joiner::Or, column, true)
+    }
+
+    fn null(mut self, joiner: Joiner, column: &str, negated: bool) -> Self {
         let column = quote(column, &mut self.error);
-        self.conditions.push(Condition::Null {
-            column,
-            negated: true,
-        });
+        self.push(joiner, Condition::Null { column, negated })
+    }
+
+    /// Adds a group of conditions joined by `AND`, in parentheses. The closure gets an empty
+    /// query and adds its conditions to it, as Laravel's `where(fn)` does:
+    ///
+    /// ```ignore
+    /// .where_group(|q| q.where_eq("title", "a").or_where_eq("title", "b"))
+    /// ```
+    ///
+    /// Only where conditions are kept from the group; `order_by`, `limit` and the other
+    /// settings are ignored. An empty group adds nothing.
+    pub fn where_group(self, f: impl FnOnce(Self) -> Self) -> Self {
+        self.group(Joiner::And, f)
+    }
+
+    /// Adds a group of conditions joined by `OR`, in parentheses. See `where_group`.
+    pub fn or_where_group(self, f: impl FnOnce(Self) -> Self) -> Self {
+        self.group(Joiner::Or, f)
+    }
+
+    fn group(mut self, joiner: Joiner, f: impl FnOnce(Self) -> Self) -> Self {
+        let inner = f(Self::blank());
+        if let Some(error) = inner.error {
+            self.error.get_or_insert(error);
+        }
+        if inner.conditions.is_empty() {
+            return self;
+        }
+        self.push(joiner, Condition::Group(inner.conditions))
+    }
+
+    fn push(mut self, joiner: Joiner, condition: Condition) -> Self {
+        self.conditions.push(Clause { joiner, condition });
         self
     }
 
@@ -201,74 +295,90 @@ impl<M: Model> Query<M> {
         self
     }
 
+    /// Locks the matching rows until the transaction ends (`SELECT ... FOR UPDATE`). It applies
+    /// to `get`, `first`, `find`, `count` and `exists`. It needs a transaction: on the database
+    /// it returns `Error::LockOutsideTransaction`.
+    pub fn for_update(mut self) -> Self {
+        self.lock = true;
+        self
+    }
+
     /// Returns every row that matches.
-    pub async fn get(mut self, db: &Database) -> Result<Vec<M>, Error> {
+    pub async fn get<'a>(mut self, db: impl Executor<'a>) -> Result<Vec<M>, Error> {
         self.take_error()?;
-        self.rows(db, &self.orders, self.limit, self.offset).await
+        self.rows(db, self.limit).await
     }
 
     /// Returns the first row in the order given by `order_by`. Without `order_by` there is no
     /// order, as with Laravel's `first`, so call `order_by` when the row matters.
-    pub async fn first(mut self, db: &Database) -> Result<Option<M>, Error> {
+    pub async fn first<'a>(mut self, db: impl Executor<'a>) -> Result<Option<M>, Error> {
         self.take_error()?;
-        let rows = self.rows(db, &self.orders, Some(1), self.offset).await?;
+        let rows = self.rows(db, Some(1)).await?;
         Ok(rows.into_iter().next())
     }
 
     /// Returns the first row, or an error when none matches.
-    pub async fn first_or_fail(self, db: &Database) -> Result<M, Error> {
+    pub async fn first_or_fail<'a>(self, db: impl Executor<'a>) -> Result<M, Error> {
         self.first(db)
             .await?
             .ok_or(Error::NotFound { table: M::TABLE })
     }
 
     /// Returns the row with the given primary key, or `None` when there is none.
-    pub async fn find(self, db: &Database, id: impl Into<Value>) -> Result<Option<M>, Error> {
+    pub async fn find<'a>(
+        self,
+        db: impl Executor<'a>,
+        id: impl Into<Value>,
+    ) -> Result<Option<M>, Error> {
         self.where_eq(M::PRIMARY_KEY, id).first(db).await
     }
 
     /// Returns the row with the given primary key, or an error when there is none.
-    pub async fn find_or_fail(self, db: &Database, id: impl Into<Value>) -> Result<M, Error> {
+    pub async fn find_or_fail<'a>(
+        self,
+        db: impl Executor<'a>,
+        id: impl Into<Value>,
+    ) -> Result<M, Error> {
         self.find(db, id)
             .await?
             .ok_or(Error::NotFound { table: M::TABLE })
     }
 
     /// Counts the rows that match.
-    pub async fn count(mut self, db: &Database) -> Result<i64, Error> {
+    pub async fn count<'a>(mut self, db: impl Executor<'a>) -> Result<i64, Error> {
         self.take_error()?;
+        let target = db.target();
+        let lock = self.lock_clause(&target)?;
         let mut values = Vec::new();
         let sql = format!(
-            "SELECT COUNT(*) FROM {}{}",
+            "SELECT COUNT(*) FROM {}{}{lock}",
             self.table,
             self.where_sql(&mut values)
         );
-        let args = bind(values)?;
-        Ok(
-            sqlx::query_scalar_with::<_, i64, _>(AssertSqlSafe(sql), args)
-                .fetch_one(db.pool())
-                .await?,
-        )
+        scalar(target, sql, bind(values)?).await
     }
 
     /// Returns whether any row matches.
-    pub async fn exists(mut self, db: &Database) -> Result<bool, Error> {
+    pub async fn exists<'a>(mut self, db: impl Executor<'a>) -> Result<bool, Error> {
         self.take_error()?;
+        let target = db.target();
+        let lock = self.lock_clause(&target)?;
         let mut values = Vec::new();
         let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM {}{})",
+            "SELECT EXISTS (SELECT 1 FROM {}{}{lock})",
             self.table,
             self.where_sql(&mut values)
         );
-        let args = bind(values)?;
-        let found: i64 = sqlx::query_scalar_with(AssertSqlSafe(sql), args)
-            .fetch_one(db.pool())
-            .await?;
+        let found = scalar(target, sql, bind(values)?).await?;
         Ok(found != 0)
     }
 
     /// Inserts one row and returns its auto-increment id. The columns must be in `FILLABLE`.
-    pub async fn insert(mut self, db: &Database, values: &[(&str, Value)]) -> Result<u64, Error> {
+    pub async fn insert<'a>(
+        mut self,
+        db: impl Executor<'a>,
+        values: &[(&str, Value)],
+    ) -> Result<u64, Error> {
         self.take_error()?;
         let mut columns = Vec::new();
         let mut params = Vec::new();
@@ -286,15 +396,17 @@ impl<M: Model> Query<M> {
                 vec!["?"; columns.len()].join(", ")
             )
         };
-        let result = sqlx::query_with(AssertSqlSafe(sql), bind(params)?)
-            .execute(db.pool())
-            .await?;
+        let result = execute(db.target(), sql, bind(params)?).await?;
         Ok(result.last_insert_id())
     }
 
     /// Sets the columns on every matching row and returns how many rows changed. The columns
     /// must be in `FILLABLE`. Order and limit are ignored.
-    pub async fn update(mut self, db: &Database, values: &[(&str, Value)]) -> Result<u64, Error> {
+    pub async fn update<'a>(
+        mut self,
+        db: impl Executor<'a>,
+        values: &[(&str, Value)],
+    ) -> Result<u64, Error> {
         self.take_error()?;
         if values.is_empty() {
             return Ok(0);
@@ -307,21 +419,17 @@ impl<M: Model> Query<M> {
         }
         let mut sql = format!("UPDATE {} SET {}", self.table, sets.join(", "));
         sql.push_str(&self.where_sql(&mut params));
-        let result = sqlx::query_with(AssertSqlSafe(sql), bind(params)?)
-            .execute(db.pool())
-            .await?;
+        let result = execute(db.target(), sql, bind(params)?).await?;
         Ok(result.rows_affected())
     }
 
     /// Deletes every matching row and returns how many rows were deleted. Order and limit are
     /// ignored.
-    pub async fn delete(mut self, db: &Database) -> Result<u64, Error> {
+    pub async fn delete<'a>(mut self, db: impl Executor<'a>) -> Result<u64, Error> {
         self.take_error()?;
         let mut values = Vec::new();
         let sql = format!("DELETE FROM {}{}", self.table, self.where_sql(&mut values));
-        let result = sqlx::query_with(AssertSqlSafe(sql), bind(values)?)
-            .execute(db.pool())
-            .await?;
+        let result = execute(db.target(), sql, bind(values)?).await?;
         Ok(result.rows_affected())
     }
 
@@ -333,36 +441,38 @@ impl<M: Model> Query<M> {
         }
     }
 
-    async fn rows(
-        &self,
-        db: &Database,
-        order: &[(String, Direction)],
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> Result<Vec<M>, Error> {
-        let columns = self.columns.as_deref().unwrap_or("*");
-        let mut values = Vec::new();
-        let sql = self.select_sql(columns, order, limit, offset, &mut values);
-        let args = bind(values)?;
-        Ok(sqlx::query_as_with::<_, M, _>(AssertSqlSafe(sql), args)
-            .fetch_all(db.pool())
-            .await?)
+    /// The ` FOR UPDATE` clause, or nothing. It is an error on the database, not a transaction.
+    fn lock_clause(&self, target: &Target<'_>) -> Result<&'static str, Error> {
+        match (self.lock, target) {
+            (false, _) => Ok(""),
+            (true, Target::Pool(_)) => Err(Error::LockOutsideTransaction),
+            (true, Target::Transaction(_)) => Ok(" FOR UPDATE"),
+        }
     }
 
-    /// Builds `SELECT` with the where clauses, order, limit and offset. Each bound value is
-    /// pushed to `values` in placeholder order.
+    async fn rows<'a>(&self, db: impl Executor<'a>, limit: Option<u64>) -> Result<Vec<M>, Error> {
+        let target = db.target();
+        let lock = self.lock_clause(&target)?;
+        let columns = self.columns.as_deref().unwrap_or("*");
+        let mut values = Vec::new();
+        let sql = self.select_sql(columns, limit, lock, &mut values);
+        fetch_rows(target, sql, bind(values)?).await
+    }
+
+    /// Builds `SELECT` with the where clauses, order, limit, offset and lock. Each bound value
+    /// is pushed to `values` in placeholder order.
     fn select_sql(
         &self,
         columns: &str,
-        order: &[(String, Direction)],
         limit: Option<u64>,
-        offset: Option<u64>,
+        lock: &str,
         values: &mut Vec<Value>,
     ) -> String {
         let mut sql = format!("SELECT {columns} FROM {}", self.table);
         sql.push_str(&self.where_sql(values));
-        if !order.is_empty() {
-            let terms: Vec<String> = order
+        if !self.orders.is_empty() {
+            let terms: Vec<String> = self
+                .orders
                 .iter()
                 .map(|(column, direction)| match direction {
                     Direction::Asc => format!("{column} ASC"),
@@ -374,14 +484,15 @@ impl<M: Model> Query<M> {
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
             values.push(Value::UInt(limit));
-        } else if offset.is_some() {
+        } else if self.offset.is_some() {
             // MySQL needs a LIMIT before OFFSET, so use its largest value.
             sql.push_str(" LIMIT 18446744073709551615");
         }
-        if let Some(offset) = offset {
+        if let Some(offset) = self.offset {
             sql.push_str(" OFFSET ?");
             values.push(Value::UInt(offset));
         }
+        sql.push_str(lock);
         sql
     }
 
@@ -390,28 +501,79 @@ impl<M: Model> Query<M> {
         if self.conditions.is_empty() {
             return String::new();
         }
-        let parts: Vec<String> = self
-            .conditions
-            .iter()
-            .map(|condition| match condition {
-                Condition::Compare { column, op, value } => {
-                    values.push(value.clone());
-                    format!("{column} {op} ?")
-                }
-                Condition::In { values: list, .. } if list.is_empty() => "0 = 1".to_owned(),
-                Condition::In {
-                    column,
-                    values: list,
-                } => {
-                    values.extend(list.iter().cloned());
-                    format!("{column} IN ({})", vec!["?"; list.len()].join(", "))
-                }
-                Condition::Null { column, negated } => {
-                    let not = if *negated { "NOT " } else { "" };
-                    format!("{column} IS {not}NULL")
-                }
-            })
-            .collect();
-        format!(" WHERE {}", parts.join(" AND "))
+        format!(" WHERE {}", render(&self.conditions, values))
     }
+}
+
+/// Joins the clauses with their `AND` or `OR`. Each bound value is pushed to `values` in order.
+fn render(clauses: &[Clause], values: &mut Vec<Value>) -> String {
+    let mut sql = String::new();
+    for (index, clause) in clauses.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(match clause.joiner {
+                Joiner::And => " AND ",
+                Joiner::Or => " OR ",
+            });
+        }
+        match &clause.condition {
+            Condition::Compare { column, op, value } => {
+                values.push(value.clone());
+                sql.push_str(&format!("{column} {op} ?"));
+            }
+            Condition::In { values: list, .. } if list.is_empty() => sql.push_str("0 = 1"),
+            Condition::In {
+                column,
+                values: list,
+            } => {
+                values.extend(list.iter().cloned());
+                sql.push_str(&format!(
+                    "{column} IN ({})",
+                    vec!["?"; list.len()].join(", ")
+                ));
+            }
+            Condition::Null { column, negated } => {
+                let not = if *negated { "NOT " } else { "" };
+                sql.push_str(&format!("{column} IS {not}NULL"));
+            }
+            Condition::Group(inner) => {
+                sql.push_str(&format!("({})", render(inner, values)));
+            }
+        }
+    }
+    sql
+}
+
+/// Runs a statement that changes rows, on the pool or on the transaction's connection.
+async fn execute(
+    target: Target<'_>,
+    sql: String,
+    args: MySqlArguments,
+) -> Result<MySqlQueryResult, Error> {
+    let query = sqlx::query_with(AssertSqlSafe(sql), args);
+    Ok(match target {
+        Target::Pool(pool) => query.execute(pool).await?,
+        Target::Transaction(conn) => query.execute(conn).await?,
+    })
+}
+
+/// Runs a query that returns one integer, on the pool or on the transaction's connection.
+async fn scalar(target: Target<'_>, sql: String, args: MySqlArguments) -> Result<i64, Error> {
+    let query = sqlx::query_scalar_with::<_, i64, _>(AssertSqlSafe(sql), args);
+    Ok(match target {
+        Target::Pool(pool) => query.fetch_one(pool).await?,
+        Target::Transaction(conn) => query.fetch_one(conn).await?,
+    })
+}
+
+/// Runs a `SELECT` and maps its rows to the model, on the pool or on the transaction's connection.
+async fn fetch_rows<M: Model>(
+    target: Target<'_>,
+    sql: String,
+    args: MySqlArguments,
+) -> Result<Vec<M>, Error> {
+    let query = sqlx::query_as_with::<_, M, _>(AssertSqlSafe(sql), args);
+    Ok(match target {
+        Target::Pool(pool) => query.fetch_all(pool).await?,
+        Target::Transaction(conn) => query.fetch_all(conn).await?,
+    })
 }

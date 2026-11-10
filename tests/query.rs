@@ -14,6 +14,11 @@ async fn connect() -> Option<Database> {
     Some(Database::connect(&url).await.expect("connects"))
 }
 
+/// The primary key of a test row, to compare the rows a query returned.
+trait HasId {
+    fn id(&self) -> i64;
+}
+
 /// Declares a row type and its model on the given table.
 macro_rules! model {
     ($name:ident, $table:literal) => {
@@ -37,6 +42,12 @@ macro_rules! model {
         impl Model for $name {
             const TABLE: &'static str = $table;
             const FILLABLE: &'static [&'static str] = &["title", "views"];
+        }
+
+        impl HasId for $name {
+            fn id(&self) -> i64 {
+                self.id
+            }
         }
     };
 }
@@ -475,5 +486,165 @@ async fn an_invalid_identifier_is_rejected() {
         .expect_err("backtick in table");
     assert!(matches!(bad_table, Error::InvalidIdentifier(ref name) if name == "orbit`bad"));
 
+    db.close().await;
+}
+
+model!(OrOne, "orbit_query_or_one");
+model!(OrTwo, "orbit_query_or_two");
+model!(OrThree, "orbit_query_or_three");
+model!(GroupOne, "orbit_query_group_one");
+model!(GroupTwo, "orbit_query_group_two");
+
+/// Creates the table of a grouped-condition test and seeds it with the rows that the tests
+/// filter: (id, title, views).
+async fn seed_group<M: Model>(db: &Database) {
+    setup(db, M::TABLE).await;
+    seed(
+        db,
+        M::TABLE,
+        &[
+            row(1, "a", Some(1)),
+            row(2, "b", Some(5)),
+            row(3, "c", Some(9)),
+            row(4, "c", Some(1)),
+            row(5, "d", None),
+        ],
+    )
+    .await;
+}
+
+/// The ids of the rows a query returns, in id order.
+async fn ids<M: Model + HasId>(query: Query<M>, db: &Database) -> Vec<i64> {
+    let rows = query
+        .order_by("id", Direction::Asc)
+        .get(db)
+        .await
+        .expect("queries");
+    rows.iter().map(HasId::id).collect()
+}
+
+#[tokio::test]
+async fn or_where_adds_an_alternative() {
+    let Some(db) = connect().await else { return };
+    seed_group::<OrOne>(&db).await;
+    seed_group::<OrTwo>(&db).await;
+    seed_group::<OrThree>(&db).await;
+
+    let matched = ids(
+        OrOne::query()
+            .where_eq("title", "a")
+            .or_where_eq("title", "b"),
+        &db,
+    )
+    .await;
+    assert_eq!(matched, vec![1, 2]);
+
+    let by_views = ids(
+        OrOne::query()
+            .where_op("views", Operator::Ge, 9)
+            .or_where_op("views", Operator::Le, 1),
+        &db,
+    )
+    .await;
+    assert_eq!(by_views, vec![1, 3, 4]);
+
+    let listed = ids(
+        OrTwo::query().where_eq("title", "a").or_where_in("id", [4]),
+        &db,
+    )
+    .await;
+    assert_eq!(listed, vec![1, 4]);
+
+    let nulls = ids(
+        OrThree::query()
+            .where_eq("title", "zzz")
+            .or_where_null("views"),
+        &db,
+    )
+    .await;
+    assert_eq!(nulls, vec![5]);
+
+    let not_nulls = ids(
+        OrThree::query()
+            .where_eq("title", "zzz")
+            .or_where_not_null("views"),
+        &db,
+    )
+    .await;
+    assert_eq!(not_nulls, vec![1, 2, 3, 4]);
+
+    teardown(&db, OrOne::TABLE).await;
+    teardown(&db, OrTwo::TABLE).await;
+    teardown(&db, OrThree::TABLE).await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn where_group_keeps_its_conditions_together() {
+    let Some(db) = connect().await else { return };
+    seed_group::<GroupOne>(&db).await;
+
+    // (title = 'a' OR title = 'b') AND views >= 5. Without the group, row 1 would match too.
+    let grouped = ids(
+        GroupOne::query()
+            .where_group(|q| q.where_eq("title", "a").or_where_eq("title", "b"))
+            .where_op("views", Operator::Ge, 5),
+        &db,
+    )
+    .await;
+    assert_eq!(grouped, vec![2]);
+
+    // id = 1 OR (title = 'c' AND views >= 5).
+    let or_group = ids(
+        GroupOne::query()
+            .where_eq("id", 1)
+            .or_where_group(|q| q.where_eq("title", "c").where_op("views", Operator::Ge, 5)),
+        &db,
+    )
+    .await;
+    assert_eq!(or_group, vec![1, 3]);
+
+    // title = 'c' AND (views < 5 OR views = 9), with the inner group nested.
+    let nested = ids(
+        GroupOne::query().where_group(|q| {
+            q.where_eq("title", "c")
+                .where_group(|g| g.where_op("views", Operator::Lt, 5).or_where_eq("views", 9))
+        }),
+        &db,
+    )
+    .await;
+    assert_eq!(nested, vec![3, 4]);
+
+    let counted = GroupOne::query()
+        .where_group(|q| q.where_eq("title", "a").or_where_eq("title", "b"))
+        .count(&db)
+        .await
+        .expect("counts");
+    assert_eq!(counted, 2);
+
+    teardown(&db, GroupOne::TABLE).await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn an_empty_group_adds_nothing_and_group_errors_surface() {
+    let Some(db) = connect().await else { return };
+    seed_group::<GroupTwo>(&db).await;
+
+    let all = GroupTwo::query()
+        .where_group(|q| q)
+        .count(&db)
+        .await
+        .expect("counts");
+    assert_eq!(all, 5);
+
+    let err = GroupTwo::query()
+        .where_group(|q| q.where_eq("bad`column", 1))
+        .count(&db)
+        .await
+        .expect_err("the group's bad column is reported");
+    assert!(matches!(err, Error::InvalidIdentifier(ref name) if name == "bad`column"));
+
+    teardown(&db, GroupTwo::TABLE).await;
     db.close().await;
 }
