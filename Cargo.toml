@@ -1,0 +1,17 @@
+[package]
+name = "orbit-orm"
+version = "0.1.0"
+edition = "2024"
+description = "An ORM for Rocket.rs apps, starting with MySQL and MariaDB"
+license = "MIT"
+repository = "https://github.com/lajennylove/Orbit"
+readme = "README.md"
+keywords = ["orm", "mysql", "mariadb", "rocket"]
+categories = ["database"]
+
+[dependencies]
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "mysql", "tls-rustls"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
