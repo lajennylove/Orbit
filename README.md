@@ -1,22 +1,14 @@
 # orbit-orm
 
-Orbit is an ORM for Rocket.rs apps, built to replace Diesel in the RocketBoost family (Propel, Ignite). The crate is `orbit-orm`.
+Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB today.
 
-**Status:** early. The connection layer works against MariaDB 13.0.2. Models and queries work; relations, soft deletes and migrations do not yet.
+## Install
 
-## Scope
+```sh
+cargo add orbit-orm --git https://github.com/lajennylove/Orbit
+```
 
-1. **MySQL and MariaDB first.** Connections, queries, and migrations for the same database Ignite uses today.
-2. **PostgreSQL and SQLite next,** once the MySQL path passes the same tests.
-
-Orbit is used by Ignite, which will move from Diesel to Orbit once Orbit covers what Ignite needs. Until then, Ignite stays on Diesel.
-
-## Design
-
-- The driver is [`sqlx`](https://crates.io/crates/sqlx), which provides the connection pool and the wire protocol. Orbit adds the ORM layer above it, the way Laravel's Eloquent sits on PDO.
-- `sqlx` is async, so Orbit fits Rocket's async handlers.
-
-## Usage
+## Connect
 
 ```rust
 use orbit_orm::Database;
@@ -25,30 +17,11 @@ let db = Database::connect("mysql://user:password@127.0.0.1/app").await?;
 db.ping().await?;
 ```
 
-## Migrations
-
-A migration is a folder named `<timestamp>_<name>`, such as `20261108000000_create_users`, with an `up.sql` and a `down.sql`. The timestamp is 14 digits, `YYYYMMDDHHMMSS`, the same format Ignite's migrations use. Migrations sort by name. A name without a timestamp is an error, and so are two migrations with the same name or the same timestamp. The `migrations` table records each applied migration with its batch number, as Laravel does.
-
-```rust
-use orbit_orm::{Database, Migrator};
-
-let db = Database::connect(&url).await?;
-let migrator = Migrator::from_dir("migrations")?;
-
-migrator.run(&db).await?;                  // applies every pending migration as one batch
-let status = migrator.status(&db).await?;  // each migration as Applied (with its batch) or Pending
-migrator.rollback(&db).await?;             // reverts the last batch, in reverse order
-```
-
-`migrations!("migrations", "20261108000000_create_users")` embeds the files at build time instead. The names are listed by hand, and a missing file is a build error.
-
-Each migration runs in its own transaction, and the run stops at the first failure, which the error names. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place. Only its DML is rolled back.
-
-`run` and `rollback` hold a MySQL named lock, `orbit_migrations`, so two processes cannot migrate at once. A second process waits for the lock up to 10 seconds (change it with `Migrator::with_lock_timeout`), then fails with `MigrationsLocked`.
+Call `db.close().await` to shut the connection pool down.
 
 ## Models and queries
 
-A model maps a table to a Rust type. Rows are read with sqlx's `FromRow`, and the model names its table and the columns it may write:
+A model maps a table to a Rust type. Rows are read with sqlx's `FromRow`. The model names its table and the columns it may write:
 
 ```rust
 use orbit_orm::{Database, Direction, Model, Operator, Query};
@@ -87,17 +60,32 @@ let post = Post::query().find_or_fail(&db, 1).await?;
 let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
 ```
 
+Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`. Sorting and paging: `order_by`, `select`, `limit`, `offset`.
+
 Values are always bound as parameters. Table and column names are quoted, and a name that is empty or contains a backtick is an error.
 
-## Differences from Laravel
+`insert` and `update` accept only columns listed in `FILLABLE`. Any other column returns `Error::NotFillable`.
 
-Orbit follows Laravel's Eloquent and query builder, with these exceptions. Each one is listed here so it is not a surprise to someone who knows Laravel.
+## Migrations
 
-- **`first()` has no default order.** As in Laravel, `first()` takes the first row the database returns. Call `order_by` when the row matters. Laravel's `sole`, `chunk` and `lazy` enforce an order; Orbit does not add one.
-- **Columns outside `FILLABLE` are an error.** `insert` and `update` return `Error::NotFillable` for a column that is not in the model's `FILLABLE` list. Laravel's `Model::create` drops such an attribute without a message, so a misspelt column is ignored. Orbit stops instead, so the mistake shows up at once. Laravel's query builder does not check `$fillable` at all; Orbit checks it on every write.
-- **`insert` returns the id.** It returns the auto-increment id as `u64`. Laravel's query builder `insert` returns a boolean, and `insertGetId` returns the id.
-- **`where_eq(column, None)` is `IS NULL`**, and `Operator::Ne` with `None` is `IS NOT NULL`, as in Laravel. Other operators with `None` match nothing, where Laravel throws.
-- **Terminal methods take the database.** `get(&db)` and the other terminal methods take the `Database` explicitly. Laravel uses a default connection.
+A migration is a folder named `<timestamp>_<name>`, such as `20261108000000_create_users`, with an `up.sql` and a `down.sql`. The timestamp is 14 digits (`YYYYMMDDHHMMSS`). Migrations run in name order.
+
+```rust
+use orbit_orm::{Database, Migrator};
+
+let db = Database::connect(&url).await?;
+let migrator = Migrator::from_dir("migrations")?;
+
+migrator.run(&db).await?;                  // applies every pending migration as one batch
+let status = migrator.status(&db).await?;  // each migration as Applied (with its batch) or Pending
+migrator.rollback(&db).await?;             // reverts the last batch, in reverse order
+```
+
+`migrations!("migrations", "20261108000000_create_users")` embeds the files in the binary at build time. List the names by hand; a missing file is a build error.
+
+Migrations are recorded in the `migrations` table with their batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
+
+`run` and `rollback` hold the MySQL lock `orbit_migrations`. A second process waits up to 10 seconds, then fails with `MigrationsLocked`. Change the wait with `Migrator::with_lock_timeout`.
 
 ## Tests
 
@@ -109,9 +97,9 @@ ORBIT_DATABASE_URL='mysql://user:password@127.0.0.1:3306/orbit_test' cargo test
 
 Without `ORBIT_DATABASE_URL`, the database tests are skipped.
 
-## Documentation
+## Differences from Laravel
 
-The docs site lives in [RocketOrbit](https://github.com/lajennylove/RocketOrbit).
+See [docs/laravel-differences.md](docs/laravel-differences.md).
 
 ## License
 
