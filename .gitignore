@@ -1,2 +1,5 @@
 /target
 .env
+
+# Local agent worktrees and Claude Code state (not part of the repository)
+/.claude/
