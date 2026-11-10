@@ -124,7 +124,7 @@ db.transaction(|tx| {
 })?;
 ```
 
-In async code, call it from `tokio::task::spawn_blocking`.
+In async code, call it from `tokio::task::spawn_blocking`. See [docs/blocking.md](docs/blocking.md) for how it runs and how its transactions roll back.
 
 ## Transactions
 

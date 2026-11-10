@@ -2,6 +2,9 @@
 //! test database, such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are
 //! skipped with a notice when it is not set. Each test uses its own table and drops it at the end.
 
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
+
 use orbit_orm::blocking::Database;
 use orbit_orm::{Error, Model, OrbitModel};
 use sqlx::AssertSqlSafe;
@@ -33,6 +36,30 @@ struct Committed {
 #[derive(Debug, PartialEq, OrbitModel)]
 #[orbit(table = "orbit_blocking_tx_rollback")]
 struct RolledBack {
+    id: i64,
+    #[orbit(fillable)]
+    title: String,
+}
+
+#[derive(Debug, PartialEq, OrbitModel)]
+#[orbit(table = "orbit_blocking_tx_panic")]
+struct Panicked {
+    id: i64,
+    #[orbit(fillable)]
+    title: String,
+}
+
+#[derive(Debug, PartialEq, OrbitModel)]
+#[orbit(table = "orbit_blocking_tx_own")]
+struct Own {
+    id: i64,
+    #[orbit(fillable)]
+    title: String,
+}
+
+#[derive(Debug, PartialEq, OrbitModel)]
+#[orbit(table = "orbit_blocking_tx_spawn_panic")]
+struct SpawnPanicked {
     id: i64,
     #[orbit(fillable)]
     title: String,
@@ -269,4 +296,105 @@ fn spawn_blocking_runs_blocking_calls() {
     );
 
     teardown(&db, Spawned::TABLE);
+}
+
+#[test]
+fn transaction_rolls_back_when_the_closure_panics() {
+    let Some(db) = connect() else { return };
+    setup(&db, Panicked::TABLE);
+
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        db.transaction(|tx| {
+            Panicked::query()
+                .blocking()
+                .insert(tx, &[("title", "never".into())])?;
+            panic!("panic inside the transaction");
+            #[allow(unreachable_code)]
+            Ok::<(), Error>(())
+        })
+    }));
+    let payload = outcome.expect_err("the panic reaches the caller");
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("panic inside the transaction")
+    );
+
+    assert_eq!(Panicked::query().blocking().count(&db).expect("counts"), 0);
+
+    teardown(&db, Panicked::TABLE);
+    db.close().expect("closes");
+}
+
+#[test]
+fn queries_in_the_transaction_see_their_own_writes() {
+    let Some(db) = connect() else { return };
+    setup(&db, Own::TABLE);
+
+    db.transaction(|tx| {
+        Own::query()
+            .blocking()
+            .insert(&mut *tx, &[("title", "inside".into())])?;
+
+        let inside = Own::query().blocking().count(&mut *tx)?;
+        assert_eq!(inside, 1, "the transaction sees its own insert");
+
+        let from_pool = Own::query().blocking().count(&db)?;
+        assert_eq!(from_pool, 0, "the pool does not see the uncommitted insert");
+        Ok::<(), Error>(())
+    })
+    .expect("commits");
+
+    assert_eq!(Own::query().blocking().count(&db).expect("counts"), 1);
+
+    teardown(&db, Own::TABLE);
+    db.close().expect("closes");
+}
+
+#[test]
+fn a_panic_on_a_blocking_thread_rolls_back_and_the_pool_still_works() {
+    let Some(db) = connect() else { return };
+    setup(&db, SpawnPanicked::TABLE);
+    let db = Arc::new(db);
+    let runtime = tokio::runtime::Runtime::new().expect("builds a runtime");
+
+    let shared = Arc::clone(&db);
+    let joined = runtime.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            shared.transaction(|tx| {
+                SpawnPanicked::query()
+                    .blocking()
+                    .insert(tx, &[("title", "never".into())])?;
+                panic!("panic on a blocking thread");
+                #[allow(unreachable_code)]
+                Ok::<(), Error>(())
+            })
+        })
+        .await
+    });
+    assert!(
+        joined.expect_err("the blocking task panicked").is_panic(),
+        "the panic is observed by the caller"
+    );
+
+    assert_eq!(
+        SpawnPanicked::query()
+            .blocking()
+            .count(&*db)
+            .expect("counts after the panic"),
+        0
+    );
+    SpawnPanicked::query()
+        .blocking()
+        .insert(&*db, &[("title", "after".into())])
+        .expect("the pool still inserts");
+    assert_eq!(
+        SpawnPanicked::query()
+            .blocking()
+            .count(&*db)
+            .expect("counts"),
+        1
+    );
+
+    teardown(&db, SpawnPanicked::TABLE);
+    db.close().expect("closes");
 }

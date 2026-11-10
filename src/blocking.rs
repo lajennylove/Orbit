@@ -78,15 +78,21 @@ impl Database {
             inner,
             runtime: Arc::clone(self.runtime_arc()),
         };
-        match f(&mut tx) {
-            Ok(value) => {
+        match panic::catch_unwind(AssertUnwindSafe(|| f(&mut tx))) {
+            Ok(Ok(value)) => {
                 self.run(tx.inner.commit())??;
                 Ok(value)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 // The error from `f` is the one to report, so a failed rollback is ignored.
                 let _ = self.run(tx.inner.rollback());
                 Err(error)
+            }
+            Err(payload) => {
+                // Roll back here, on the runtime. Dropping the connection during the unwind
+                // would need a Tokio context, and panics there, which aborts the process.
+                let _ = self.run(tx.inner.rollback());
+                panic::resume_unwind(payload)
             }
         }
     }
