@@ -82,10 +82,6 @@ pub enum Error {
     #[error("no query results for table `{table}`")]
     NotFound { table: &'static str },
 
-    /// `for_update` locks rows until the transaction ends, so it needs a transaction.
-    #[error("for_update needs a transaction; run the query inside Database::transaction")]
-    LockOutsideTransaction,
-
     /// A blocking call ran on a thread that runs async code. Run it inside `spawn_blocking`.
     #[error("blocking call on an async thread; run it inside tokio::task::spawn_blocking")]
     BlockingInRuntime,

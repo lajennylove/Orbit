@@ -7,6 +7,8 @@ use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Error, Fields, Ident, LitStr, Result, parse_macro_input};
 
+mod naming;
+
 /// Implements `FromRow` and `Model` for a struct with named fields.
 #[proc_macro_derive(OrbitModel, attributes(orbit))]
 pub fn derive_orbit_model(input: TokenStream) -> TokenStream {
@@ -54,18 +56,22 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2> {
     let options = struct_options(input)?;
     let columns = named.named.iter().map(column).collect::<Result<Vec<_>>>()?;
 
-    let table = options.table.ok_or_else(|| {
-        Error::new_spanned(
-            &input.ident,
-            "missing `table`: add #[orbit(table = \"...\")] to the struct",
-        )
-    })?;
-    if table.value().is_empty() {
-        return Err(Error::new_spanned(
-            &table,
-            "the table name must not be empty",
-        ));
-    }
+    // Without `table`, the name is Laravel's default: the plural of the struct name.
+    let table = match options.table {
+        Some(table) => {
+            if table.value().is_empty() {
+                return Err(Error::new_spanned(
+                    &table,
+                    "the table name must not be empty",
+                ));
+            }
+            table
+        }
+        None => LitStr::new(
+            &naming::table_name(&input.ident.unraw().to_string()),
+            input.ident.span(),
+        ),
+    };
 
     let primary_key = match &options.primary_key {
         Some(key) => {

@@ -27,7 +27,7 @@ Call `db.close().await` to shut the connection pool down.
 
 ## Models and queries
 
-A model maps a table to a Rust type and names the columns it may write. The `OrbitModel` derive writes the row mapping and the model from attributes:
+A model maps a table to a Rust type and names the columns it may write. The `OrbitModel` derive writes the row mapping and the model from attributes. Without `table`, the table is the plural of the struct name, as in Laravel: `Flight` uses `flights`, `UserProfile` uses `user_profiles`.
 
 ```rust
 use orbit_orm::OrbitModel;
@@ -84,7 +84,7 @@ let post = Post::query().find_or_fail(&db, 1).await?;
 let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
 ```
 
-Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`, `replace`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`, inside a transaction only.
+Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`, `replace`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`.
 
 Conditions are grouped in parentheses with `where_group` and `or_where_group`:
 
@@ -144,7 +144,7 @@ let id = db
     .await?;
 ```
 
-`for_update` locks the matching rows until the transaction ends. Outside a transaction it returns `Error::LockOutsideTransaction`. `tx.connection()` gives the raw connection for SQL that Orbit does not wrap.
+`for_update` locks the matching rows. In a transaction the lock lasts until it ends. Outside one, the statement runs in autocommit and the lock lasts only for that statement, as in Laravel. `tx.connection()` gives the raw connection for SQL that Orbit does not wrap.
 
 ## Errors
 
@@ -178,6 +178,8 @@ migrator.rollback(&db).await?;             // reverts the last batch, in reverse
 ```
 
 `migrations!("migrations", "20261108000000_create_users")` embeds the files in the binary at build time. List the names by hand; a missing file is a build error.
+
+To move from Diesel, `import_diesel_history` records the migrations that Diesel already applied, from its `__diesel_schema_migrations` table, without running any `up.sql`. `unmatched_diesel_versions` lists the Diesel versions that have no folder in the migrator.
 
 Migrations are recorded in the `migrations` table with their batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
 
