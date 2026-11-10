@@ -1,0 +1,5 @@
+error: OrbitModel can only be derived for a struct
+ --> tests/ui/enum_model.rs:5:6
+  |
+5 | enum Post {
+  |      ^^^^

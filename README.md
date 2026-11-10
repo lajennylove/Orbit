@@ -21,7 +21,25 @@ Call `db.close().await` to shut the connection pool down.
 
 ## Models and queries
 
-A model maps a table to a Rust type. Rows are read with sqlx's `FromRow`. The model names its table and the columns it may write:
+A model maps a table to a Rust type and names the columns it may write. The `OrbitModel` derive writes the row mapping and the model from attributes:
+
+```rust
+use orbit_orm::OrbitModel;
+
+#[derive(OrbitModel)]
+#[orbit(table = "posts")]
+struct Post {
+    id: i64,
+    #[orbit(fillable)]
+    title: String,
+    #[orbit(column = "view_count", fillable)]
+    views: Option<i64>,
+}
+```
+
+`#[orbit(primary_key = "...")]` sets the primary key, and `#[orbit(skip)]` leaves a field out of the row.
+
+Without the derive, write the two impls by hand. Rows are read with sqlx's `FromRow`:
 
 ```rust
 use orbit_orm::{Database, Direction, Model, Operator, Query};

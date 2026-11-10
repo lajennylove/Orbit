@@ -9,7 +9,15 @@ readme = "README.md"
 keywords = ["orm", "mysql", "mariadb", "rocket"]
 categories = ["database"]
 
+[workspace]
+members = [".", "orbit-macros"]
+
+[features]
+default = ["derive"]
+derive = ["dep:orbit-macros"]
+
 [dependencies]
+orbit-macros = { version = "0.1.0", path = "orbit-macros", optional = true }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "mysql", "tls-rustls"] }
 thiserror = "2.0.21"
 

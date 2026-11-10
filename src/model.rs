@@ -3,7 +3,7 @@ use sqlx::mysql::MySqlRow;
 
 use crate::Query;
 
-/// A table and the Rust type that its rows map to. Written by hand for now; a derive comes later.
+/// A table and the Rust type that its rows map to. Derive it with `#[derive(OrbitModel)]`, or write it by hand.
 pub trait Model: for<'r> FromRow<'r, MySqlRow> + Send + Unpin + Sized {
     /// The table name.
     const TABLE: &'static str;

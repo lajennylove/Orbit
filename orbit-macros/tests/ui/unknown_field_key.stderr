@@ -1,0 +1,5 @@
+error: unknown key; a field takes `column`, `skip` and `fillable`
+ --> tests/ui/unknown_field_key.rs:7:13
+  |
+7 |     #[orbit(colum = "title")]
+  |             ^^^^^
