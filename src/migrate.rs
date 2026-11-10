@@ -3,7 +3,9 @@
 //! `migrations` table with a batch number, and a rollback reverts the last batch.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use sqlx::AssertSqlSafe;
 
@@ -50,11 +52,27 @@ pub struct Status {
 #[derive(Debug, Clone)]
 pub struct Migrator {
     migrations: Vec<Migration>,
+    lock_timeout: Duration,
 }
 
+/// The name of the MySQL lock that serialises `run` and `rollback` across processes.
+const LOCK_NAME: &str = "orbit_migrations";
+
+/// How long `run` and `rollback` wait for another process's lock before giving up.
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Migrator {
-    /// Sorts the migrations by name. Two migrations with the same name are an error.
+    /// Sorts the migrations by name. A name must start with a 14-digit timestamp and an
+    /// underscore, as `20261108000000_create_users` does. Two migrations with the same name, or
+    /// the same timestamp, are an error.
     pub fn new(mut migrations: Vec<Migration>) -> Result<Self, Error> {
+        for migration in &migrations {
+            if !has_timestamp(&migration.name) {
+                return Err(Error::InvalidMigrationName {
+                    name: migration.name.clone(),
+                });
+            }
+        }
         migrations.sort_by(|a, b| a.name.cmp(&b.name));
         for pair in migrations.windows(2) {
             if pair[0].name == pair[1].name {
@@ -62,8 +80,23 @@ impl Migrator {
                     name: pair[0].name.clone(),
                 });
             }
+            if timestamp(&pair[0].name) == timestamp(&pair[1].name) {
+                return Err(Error::DuplicateTimestamp {
+                    first: pair[0].name.clone(),
+                    second: pair[1].name.clone(),
+                });
+            }
         }
-        Ok(Self { migrations })
+        Ok(Self {
+            migrations,
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
+        })
+    }
+
+    /// Sets how long `run` and `rollback` wait for another process to finish its migrations.
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
     }
 
     /// The migrations in name order.
@@ -103,7 +136,14 @@ impl Migrator {
     ///
     /// MySQL does not roll back DDL. A failing migration can leave the DDL it ran before the
     /// failure in place; only its DML is rolled back. Returns the names that were applied.
+    ///
+    /// Only one process runs migrations at a time. A second process waits up to the lock timeout,
+    /// then fails with [`Error::MigrationsLocked`].
     pub async fn run(&self, db: &Database) -> Result<Vec<String>, Error> {
+        self.with_lock(db, self.run_unlocked(db)).await
+    }
+
+    async fn run_unlocked(&self, db: &Database) -> Result<Vec<String>, Error> {
         ensure_table(db).await?;
         let applied = applied(db).await?;
         let pending: Vec<&Migration> = self
@@ -167,6 +207,10 @@ impl Migrator {
     ///
     /// As with [`run`](Self::run), DDL in a `down.sql` is not rolled back by MySQL.
     pub async fn rollback(&self, db: &Database) -> Result<Vec<String>, Error> {
+        self.with_lock(db, self.rollback_unlocked(db)).await
+    }
+
+    async fn rollback_unlocked(&self, db: &Database) -> Result<Vec<String>, Error> {
         ensure_table(db).await?;
         let last: Option<i64> = sqlx::query_scalar("SELECT MAX(batch) FROM migrations")
             .fetch_one(db.pool())
@@ -233,6 +277,52 @@ macro_rules! migrations {
             )*
         ])
     };
+}
+
+impl Migrator {
+    /// Runs `body` while holding the migrations lock. The lock is a MySQL named lock, held by one
+    /// pooled connection, so it lasts for the whole run and is released when the run ends.
+    async fn with_lock<T>(
+        &self,
+        db: &Database,
+        body: impl Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let mut conn = db.pool().acquire().await?;
+        let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
+            .bind(LOCK_NAME)
+            .bind(self.lock_timeout.as_secs() as i64)
+            .fetch_one(&mut *conn)
+            .await?;
+        if got != Some(1) {
+            return Err(Error::MigrationsLocked {
+                seconds: self.lock_timeout.as_secs(),
+            });
+        }
+
+        let result = body.await;
+        let released = sqlx::query("SELECT RELEASE_LOCK(?)")
+            .bind(LOCK_NAME)
+            .execute(&mut *conn)
+            .await;
+        if released.is_err() {
+            // Closing the connection drops the lock on the server, so it cannot stay in the pool.
+            drop(conn.detach());
+        }
+        let value = result?;
+        released?;
+        Ok(value)
+    }
+}
+
+/// Whether the name starts with a 14-digit timestamp and an underscore, followed by a name.
+fn has_timestamp(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 15 && bytes[..14].iter().all(u8::is_ascii_digit) && bytes[14] == b'_'
+}
+
+/// The timestamp of a name that passed `has_timestamp`.
+fn timestamp(name: &str) -> &str {
+    &name[..14]
 }
 
 /// Creates the `migrations` table if it does not exist yet.

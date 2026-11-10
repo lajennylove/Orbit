@@ -27,7 +27,7 @@ db.ping().await?;
 
 ## Migrations
 
-A migration is a folder named `<timestamp>_<name>` with an `up.sql` and a `down.sql`, the same layout Ignite uses. The `migrations` table records each applied migration with its batch number, as Laravel does. Migrations sort by name, and a duplicate name is an error.
+A migration is a folder named `<timestamp>_<name>`, such as `20261108000000_create_users`, with an `up.sql` and a `down.sql`. The timestamp is 14 digits, `YYYYMMDDHHMMSS`, the same format Ignite's migrations use. Migrations sort by name. A name without a timestamp is an error, and so are two migrations with the same name or the same timestamp. The `migrations` table records each applied migration with its batch number, as Laravel does.
 
 ```rust
 use orbit_orm::{Database, Migrator};
@@ -42,7 +42,9 @@ migrator.rollback(&db).await?;             // reverts the last batch, in reverse
 
 `migrations!("migrations", "20261108000000_create_users")` embeds the files at build time instead. The names are listed by hand, and a missing file is a build error.
 
-Each migration runs in its own transaction, and the run stops at the first failure, which the error names. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place. Only its DML is rolled back. Run migrations from one process at a time, as a deploy step.
+Each migration runs in its own transaction, and the run stops at the first failure, which the error names. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place. Only its DML is rolled back.
+
+`run` and `rollback` hold a MySQL named lock, `orbit_migrations`, so two processes cannot migrate at once. A second process waits for the lock up to 10 seconds (change it with `Migrator::with_lock_timeout`), then fails with `MigrationsLocked`.
 
 ## Models and queries
 

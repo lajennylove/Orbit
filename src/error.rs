@@ -18,6 +18,18 @@ pub enum Error {
     #[error("migration `{name}` is defined more than once")]
     DuplicateMigration { name: String },
 
+    /// A migration name does not start with a 14-digit timestamp and an underscore.
+    #[error("migration `{name}` must start with a 14-digit timestamp, such as 20261108000000_name")]
+    InvalidMigrationName { name: String },
+
+    /// Two migrations share a timestamp, so their order is not defined.
+    #[error("migrations `{first}` and `{second}` have the same timestamp")]
+    DuplicateTimestamp { first: String, second: String },
+
+    /// Another process is running migrations and did not finish within the lock timeout.
+    #[error("another process is running migrations; gave up after {seconds} seconds")]
+    MigrationsLocked { seconds: u64 },
+
     /// A migration's `up.sql` failed. The run stopped there; earlier migrations stay applied.
     #[error("migration `{name}` failed, so the run stopped: {source}")]
     MigrationFailed { name: String, source: sqlx::Error },

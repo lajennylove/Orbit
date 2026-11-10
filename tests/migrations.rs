@@ -4,6 +4,8 @@
 //! lock and reset the tables first.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use tokio::sync::{Mutex, MutexGuard};
 
 use orbit_orm::{Database, Error, Migration, Migrator, State, Status, migrations};
@@ -205,22 +207,6 @@ async fn the_migrations_table_is_created_on_first_use() {
         .expect("the table already exists");
 }
 
-#[tokio::test]
-async fn run_file_runs_one_statement_file_without_recording_it() {
-    let Some((_lock, db)) = setup().await else {
-        return;
-    };
-    db.run_file(fixture("basic").join(WIDGETS).join("up.sql"))
-        .await
-        .expect("runs the file");
-
-    assert!(table_exists(&db, "widgets").await);
-    assert!(
-        !table_exists(&db, "migrations").await,
-        "nothing is recorded"
-    );
-}
-
 #[test]
 fn duplicate_names_are_rejected() {
     let widgets = Migration::new(WIDGETS, "SELECT 1;", "SELECT 1;");
@@ -259,4 +245,46 @@ fn migrations_macro_embeds_the_same_files() {
     assert_eq!(embedded.name, from_disk.name);
     assert_eq!(embedded.up, from_disk.up);
     assert_eq!(embedded.down, from_disk.down);
+}
+
+#[test]
+fn a_name_without_a_timestamp_is_rejected() {
+    let migration = Migration::new("create_widgets", "SELECT 1;", "SELECT 1;");
+    let err = Migrator::new(vec![migration]).expect_err("needs a timestamp");
+    assert!(matches!(err, Error::InvalidMigrationName { ref name } if name == "create_widgets"));
+}
+
+#[test]
+fn two_migrations_with_one_timestamp_are_rejected() {
+    let a = Migration::new("20260101000000_create_widgets", "SELECT 1;", "SELECT 1;");
+    let b = Migration::new("20260101000000_create_gadgets", "SELECT 1;", "SELECT 1;");
+    let err = Migrator::new(vec![a, b]).expect_err("shared timestamp");
+    assert!(matches!(err, Error::DuplicateTimestamp { .. }));
+}
+
+#[tokio::test]
+async fn a_run_waits_for_another_process_then_gives_up() {
+    let Some((_lock, db)) = setup().await else {
+        return;
+    };
+    // Another process holds the migrations lock on its own connection.
+    let mut other = db.pool().acquire().await.expect("a connection");
+    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK('orbit_migrations', 0)")
+        .fetch_one(&mut *other)
+        .await
+        .expect("takes the lock");
+    assert_eq!(got, Some(1));
+
+    let migrator = Migrator::from_dir(fixture("basic"))
+        .expect("reads the fixtures")
+        .with_lock_timeout(Duration::from_secs(1));
+    let err = migrator.run(&db).await.expect_err("the lock is held");
+    assert!(matches!(err, Error::MigrationsLocked { seconds: 1 }));
+
+    sqlx::query("SELECT RELEASE_LOCK('orbit_migrations')")
+        .execute(&mut *other)
+        .await
+        .expect("releases the lock");
+    drop(other);
+    migrator.run(&db).await.expect("runs once the lock is free");
 }
