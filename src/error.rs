@@ -30,4 +30,16 @@ pub enum Error {
     /// be rolled back.
     #[error("migration `{name}` is applied but has no files here, so it cannot be rolled back")]
     UnknownMigration { name: String },
+
+    /// A table or column name is empty or contains a backtick.
+    #[error("invalid identifier `{0}`: names must not be empty or contain a backtick")]
+    InvalidIdentifier(String),
+
+    /// A column is not in the model's `FILLABLE` list.
+    #[error("column `{column}` is not fillable on table `{table}`")]
+    NotFillable { table: &'static str, column: String },
+
+    /// A query that must find a row found none.
+    #[error("no query results for table `{table}`")]
+    NotFound { table: &'static str },
 }

@@ -2,7 +2,7 @@
 
 Orbit is an ORM for Rocket.rs apps, built to replace Diesel in the RocketBoost family (Propel, Ignite). The crate is `orbit-orm`.
 
-**Status:** early. The connection layer works against MariaDB 13.0.2. No models or queries yet.
+**Status:** early. The connection layer works against MariaDB 13.0.2. Models and queries work; relations, soft deletes and migrations do not yet.
 
 ## Scope
 
@@ -43,6 +43,49 @@ migrator.rollback(&db).await?;             // reverts the last batch, in reverse
 `migrations!("migrations", "20261108000000_create_users")` embeds the files at build time instead. The names are listed by hand, and a missing file is a build error.
 
 Each migration runs in its own transaction, and the run stops at the first failure, which the error names. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place. Only its DML is rolled back. Run migrations from one process at a time, as a deploy step.
+
+## Models and queries
+
+A model maps a table to a Rust type. Rows are read with sqlx's `FromRow`, and the model names its table and the columns it may write:
+
+```rust
+use orbit_orm::{Database, Direction, Model, Operator, Query};
+use sqlx::mysql::MySqlRow;
+use sqlx::{FromRow, Row};
+
+struct Post {
+    id: i64,
+    title: String,
+    views: i64,
+}
+
+impl<'r> FromRow<'r, MySqlRow> for Post {
+    fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            title: row.try_get("title")?,
+            views: row.try_get("views")?,
+        })
+    }
+}
+
+impl Model for Post {
+    const TABLE: &'static str = "posts";
+    const FILLABLE: &'static [&'static str] = &["title", "views"];
+}
+
+let popular = Post::query()
+    .where_op("views", Operator::Ge, 100)
+    .order_by("views", Direction::Desc)
+    .limit(10)
+    .get(&db)
+    .await?;
+
+let post = Post::query().find_or_fail(&db, 1).await?;
+let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
+```
+
+Values are always bound as parameters. Table and column names are quoted, and a name that is empty or contains a backtick is an error.
 
 ## Tests
 

@@ -7,7 +7,13 @@
 mod database;
 mod error;
 mod migrate;
+mod model;
+mod query;
+mod value;
 
 pub use database::Database;
 pub use error::Error;
 pub use migrate::{Migration, Migrator, State, Status};
+pub use model::Model;
+pub use query::{Direction, Operator, Query};
+pub use value::Value;
