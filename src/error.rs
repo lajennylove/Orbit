@@ -81,10 +81,6 @@ pub enum Error {
     /// A query that must find a row found none.
     #[error("no query results for table `{table}`")]
     NotFound { table: &'static str },
-
-    /// `for_update` locks rows until the transaction ends, so it needs a transaction.
-    #[error("for_update needs a transaction; run the query inside Database::transaction")]
-    LockOutsideTransaction,
 }
 
 impl From<sqlx::Error> for Error {

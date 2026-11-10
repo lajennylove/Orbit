@@ -231,27 +231,49 @@ async fn for_update_locks_the_row_for_other_transactions() {
 }
 
 #[tokio::test]
-async fn for_update_outside_a_transaction_is_an_error() {
+async fn for_update_outside_a_transaction_runs_in_autocommit() {
     let Some(db) = connect().await else { return };
     setup(&db, LockOutside::TABLE).await;
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO `{}` (id, title) VALUES (1, 'a')",
+        LockOutside::TABLE
+    )))
+    .execute(db.pool())
+    .await
+    .expect("seeds a row");
 
+    // On the pool, FOR UPDATE runs in autocommit and succeeds, as Laravel's lockForUpdate does.
     let fetched = LockOutside::query()
         .where_eq("id", 1)
         .for_update()
         .first(&db)
         .await
-        .expect_err("for_update needs a transaction");
-    assert!(matches!(fetched, Error::LockOutsideTransaction));
+        .expect("the locked read succeeds");
+    assert_eq!(fetched.map(|row| row.title), Some("a".to_owned()));
 
-    let counted = LockOutside::query()
+    let all = LockOutside::query()
         .for_update()
-        .count(&db)
+        .get(&db)
         .await
-        .expect_err("for_update needs a transaction");
-    assert!(matches!(counted, Error::LockOutsideTransaction));
+        .expect("the locked read succeeds");
+    assert_eq!(all.len(), 1);
 
-    // Nothing ran, so the table is still empty.
-    assert_eq!(LockOutside::query().count(&db).await.expect("counts"), 0);
+    assert_eq!(
+        LockOutside::query()
+            .for_update()
+            .count(&db)
+            .await
+            .expect("the locked count succeeds"),
+        1
+    );
+    assert!(
+        LockOutside::query()
+            .where_eq("id", 1)
+            .for_update()
+            .exists(&db)
+            .await
+            .expect("the locked exists succeeds")
+    );
 
     teardown(&db, LockOutside::TABLE).await;
     db.close().await;

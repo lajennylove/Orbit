@@ -295,9 +295,9 @@ impl<M: Model> Query<M> {
         self
     }
 
-    /// Locks the matching rows until the transaction ends (`SELECT ... FOR UPDATE`). It applies
-    /// to `get`, `first`, `find`, `count` and `exists`. It needs a transaction: on the database
-    /// it returns `Error::LockOutsideTransaction`.
+    /// Locks the matching rows (`SELECT ... FOR UPDATE`). It applies to `get`, `first`, `find`,
+    /// `count` and `exists`. In a transaction the lock lasts until it ends. On the pool it lasts
+    /// only for the statement, in autocommit, as Laravel's `lockForUpdate()` does.
     pub fn for_update(mut self) -> Self {
         self.lock = true;
         self
@@ -348,7 +348,7 @@ impl<M: Model> Query<M> {
     pub async fn count<'a>(mut self, db: impl Executor<'a>) -> Result<i64, Error> {
         self.take_error()?;
         let target = db.target();
-        let lock = self.lock_clause(&target)?;
+        let lock = self.lock_clause();
         let mut values = Vec::new();
         let sql = format!(
             "SELECT COUNT(*) FROM {}{}{lock}",
@@ -362,7 +362,7 @@ impl<M: Model> Query<M> {
     pub async fn exists<'a>(mut self, db: impl Executor<'a>) -> Result<bool, Error> {
         self.take_error()?;
         let target = db.target();
-        let lock = self.lock_clause(&target)?;
+        let lock = self.lock_clause();
         let mut values = Vec::new();
         let sql = format!(
             "SELECT EXISTS (SELECT 1 FROM {}{}{lock})",
@@ -441,18 +441,14 @@ impl<M: Model> Query<M> {
         }
     }
 
-    /// The ` FOR UPDATE` clause, or nothing. It is an error on the database, not a transaction.
-    fn lock_clause(&self, target: &Target<'_>) -> Result<&'static str, Error> {
-        match (self.lock, target) {
-            (false, _) => Ok(""),
-            (true, Target::Pool(_)) => Err(Error::LockOutsideTransaction),
-            (true, Target::Transaction(_)) => Ok(" FOR UPDATE"),
-        }
+    /// The ` FOR UPDATE` clause, or nothing.
+    fn lock_clause(&self) -> &'static str {
+        if self.lock { " FOR UPDATE" } else { "" }
     }
 
     async fn rows<'a>(&self, db: impl Executor<'a>, limit: Option<u64>) -> Result<Vec<M>, Error> {
         let target = db.target();
-        let lock = self.lock_clause(&target)?;
+        let lock = self.lock_clause();
         let columns = self.columns.as_deref().unwrap_or("*");
         let mut values = Vec::new();
         let sql = self.select_sql(columns, limit, lock, &mut values);
