@@ -528,6 +528,7 @@ name = "orbit-orm"
 version = "0.1.0"
 dependencies = [
  "orbit-macros",
+ "orbit-orm",
  "sqlx",
  "thiserror",
  "tokio",

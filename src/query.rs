@@ -375,10 +375,38 @@ impl<M: Model> Query<M> {
 
     /// Inserts one row and returns its auto-increment id. The columns must be in `FILLABLE`.
     pub async fn insert<'a>(
-        mut self,
+        self,
         db: impl Executor<'a>,
         values: &[(&str, Value)],
     ) -> Result<u64, Error> {
+        let result = self.write_row(db, "INSERT", values).await?;
+        Ok(result.last_insert_id())
+    }
+
+    /// Replaces the row that has the same unique key or primary key as `values`, or inserts the
+    /// row when none has. Returns the rows affected, as MySQL reports them: 1 for a plain insert,
+    /// and 2 when a row was replaced, since MySQL deletes the old row and inserts the new one.
+    ///
+    /// This is Diesel's `replace_into`, which issues MySQL's `REPLACE INTO`. It is not Laravel's
+    /// `upsert`, which is `INSERT ... ON DUPLICATE KEY UPDATE`. The old row is deleted, so its
+    /// auto-increment id changes and columns not in `values` take their defaults. The columns
+    /// must be in `FILLABLE`.
+    pub async fn replace<'a>(
+        self,
+        db: impl Executor<'a>,
+        values: &[(&str, Value)],
+    ) -> Result<u64, Error> {
+        let result = self.write_row(db, "REPLACE", values).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Runs `INSERT` or `REPLACE` with the given columns. The columns must be in `FILLABLE`.
+    async fn write_row<'a>(
+        mut self,
+        db: impl Executor<'a>,
+        keyword: &str,
+        values: &[(&str, Value)],
+    ) -> Result<MySqlQueryResult, Error> {
         self.take_error()?;
         let mut columns = Vec::new();
         let mut params = Vec::new();
@@ -387,17 +415,16 @@ impl<M: Model> Query<M> {
             params.push(value.clone());
         }
         let sql = if columns.is_empty() {
-            format!("INSERT INTO {} () VALUES ()", self.table)
+            format!("{keyword} INTO {} () VALUES ()", self.table)
         } else {
             format!(
-                "INSERT INTO {} ({}) VALUES ({})",
+                "{keyword} INTO {} ({}) VALUES ({})",
                 self.table,
                 columns.join(", "),
                 vec!["?"; columns.len()].join(", ")
             )
         };
-        let result = execute(db.target(), sql, bind(params)?).await?;
-        Ok(result.last_insert_id())
+        execute(db.target(), sql, bind(params)?).await
     }
 
     /// Sets the columns on every matching row and returns how many rows changed. The columns

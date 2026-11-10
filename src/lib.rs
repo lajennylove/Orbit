@@ -4,6 +4,8 @@
 //! Orbit uses `sqlx` for the connection pool and the wire protocol, and adds the ORM layer
 //! on top of it.
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
 mod database;
 mod error;
 mod migrate;

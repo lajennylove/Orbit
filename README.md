@@ -8,6 +8,12 @@ Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB today.
 cargo add orbit-orm --git https://github.com/lajennylove/Orbit
 ```
 
+For the synchronous API, enable the `blocking` feature:
+
+```sh
+cargo add orbit-orm --features blocking --git https://github.com/lajennylove/Orbit
+```
+
 ## Connect
 
 ```rust
@@ -78,7 +84,7 @@ let post = Post::query().find_or_fail(&db, 1).await?;
 let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
 ```
 
-Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`, inside a transaction only.
+Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`, `replace`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`, inside a transaction only.
 
 Conditions are grouped in parentheses with `where_group` and `or_where_group`:
 
@@ -93,6 +99,32 @@ let posts = Post::query()
 Values are always bound as parameters. Table and column names are quoted, and a name that is empty or contains a backtick is an error.
 
 `insert` and `update` accept only columns listed in `FILLABLE`. Any other column returns `Error::NotFillable`.
+
+`replace` writes a row the way MySQL's `REPLACE INTO` does: it overwrites the row that has the same unique key, and returns the rows affected.
+
+```rust
+let affected = Query::<Post>::table()
+    .replace(&db, &[("title", "Hello".into())])
+    .await?;
+```
+
+## Blocking API
+
+With the `blocking` feature, `orbit_orm::blocking` has the same terminal methods without `async`. Build the query as usual, then call `blocking()`:
+
+```rust
+use orbit_orm::blocking::Database;
+
+let db = Database::connect("mysql://user:password@127.0.0.1/app")?;
+let post = Post::query().blocking().find_or_fail(&db, 1)?;
+
+db.transaction(|tx| {
+    Post::query().blocking().insert(tx, &[("title", "Hello".into())])?;
+    Ok::<_, orbit_orm::Error>(())
+})?;
+```
+
+In async code, call it from `tokio::task::spawn_blocking`.
 
 ## Transactions
 
