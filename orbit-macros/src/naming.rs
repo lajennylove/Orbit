@@ -179,6 +179,7 @@ const RULES: &[Rule] = &[
     Rule::Suffix("axis", "axes"),
     Rule::Suffix("crisis", "crises"),
     Rule::Suffix("thesis", "theses"),
+    Rule::Suffix("testis", "testes"),
     Rule::Suffix("s", "s"),
     Rule::Suffix("", "s"),
 ];
@@ -370,8 +371,9 @@ const UNINFLECTED: &[&str] = &[
     "lucchese",
     "luggage",
     "mackerel",
-    "Maltese",
+    "maltese",
     "management",
+    "media",
     "metadata",
     "mews",
     "money",
@@ -387,6 +389,7 @@ const UNINFLECTED: &[&str] = &[
     "oil",
     "patience",
     "pekingese",
+    "people",
     "piedmontese",
     "pincers",
     "pistoiese",
@@ -425,6 +428,7 @@ const UNINFLECTED: &[&str] = &[
     "toothpaste",
     "traffic",
     "travel",
+    "trivia",
     "trousers",
     "trout",
     "tuna",
@@ -504,6 +508,25 @@ mod tests {
         assert_eq!(plural("News"), "News");
         assert_eq!(plural("Related"), "Related");
         assert_eq!(plural("Software"), "Software");
+    }
+
+    #[test]
+    fn plural_keeps_words_doctrine_lists_as_plural_forms() {
+        // Doctrine's plural list has these as uninflected. `Maltese` was once stored with a
+        // capital, so it never matched the lowercased word.
+        assert_eq!(plural("Media"), "Media");
+        assert_eq!(plural("Multimedia"), "Multimedia");
+        assert_eq!(plural("People"), "People");
+        assert_eq!(plural("Trivia"), "Trivia");
+        assert_eq!(plural("Maltese"), "Maltese");
+        assert_eq!(table_name("SocialMedia"), "social_media");
+        assert_eq!(table_name("Trivia"), "trivia");
+    }
+
+    #[test]
+    fn plural_follows_the_testis_rule() {
+        assert_eq!(plural("Testis"), "Testes");
+        assert_eq!(table_name("SpermTestis"), "sperm_testes");
     }
 
     #[test]
