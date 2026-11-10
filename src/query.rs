@@ -207,17 +207,11 @@ impl<M: Model> Query<M> {
         self.rows(db, &self.orders, self.limit, self.offset).await
     }
 
-    /// Returns the first row, ordered by the primary key unless `order_by` was called.
+    /// Returns the first row in the order given by `order_by`. Without `order_by` there is no
+    /// order, as with Laravel's `first`, so call `order_by` when the row matters.
     pub async fn first(mut self, db: &Database) -> Result<Option<M>, Error> {
         self.take_error()?;
-        let primary = checked(M::PRIMARY_KEY)?;
-        let default_order = [(primary, Direction::Asc)];
-        let order = if self.orders.is_empty() {
-            &default_order[..]
-        } else {
-            &self.orders[..]
-        };
-        let rows = self.rows(db, order, Some(1), self.offset).await?;
+        let rows = self.rows(db, &self.orders, Some(1), self.offset).await?;
         Ok(rows.into_iter().next())
     }
 

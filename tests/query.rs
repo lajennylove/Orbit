@@ -144,7 +144,7 @@ async fn find_or_fail_errors_with_the_table_name() {
 }
 
 #[tokio::test]
-async fn first_orders_by_the_primary_key_unless_ordered() {
+async fn first_returns_the_row_in_the_order_given() {
     let Some(db) = connect().await else { return };
     setup(&db, First::TABLE).await;
     assert_eq!(First::query().first(&db).await.expect("queries"), None);
@@ -156,7 +156,15 @@ async fn first_orders_by_the_primary_key_unless_ordered() {
     )
     .await;
 
-    let first = First::query().first(&db).await.expect("queries");
+    // Without order_by, first() has no order, so the row is one of the three.
+    let any = First::query().first(&db).await.expect("queries");
+    assert!(any.is_some());
+
+    let first = Query::<First>::table()
+        .order_by("id", Direction::Asc)
+        .first(&db)
+        .await
+        .expect("queries");
     assert_eq!(first.map(|r| r.id), Some(1));
 
     let last = Query::<First>::table()
@@ -166,7 +174,11 @@ async fn first_orders_by_the_primary_key_unless_ordered() {
         .expect("queries");
     assert_eq!(last.map(|r| r.id), Some(3));
 
-    let first_or_fail = First::query().first_or_fail(&db).await.expect("finds");
+    let first_or_fail = Query::<First>::table()
+        .order_by("id", Direction::Asc)
+        .first_or_fail(&db)
+        .await
+        .expect("finds");
     assert_eq!(first_or_fail.id, 1);
 
     teardown(&db, First::TABLE).await;
