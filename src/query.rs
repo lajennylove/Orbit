@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
-use sqlx::AssertSqlSafe;
-use sqlx::mysql::{MySqlArguments, MySqlQueryResult};
+use sqlx::mysql::{MySqlArguments, MySqlQueryResult, MySqlRow};
+use sqlx::{AssertSqlSafe, FromRow};
 
 use crate::transaction::{Executor, Target};
 use crate::value::bind;
@@ -309,11 +309,39 @@ impl<M: Model> Query<M> {
         self.rows(db, self.limit).await
     }
 
+    /// Returns every row that matches, decoded as `T` instead of the model. Use it with `select`
+    /// to read some columns into a tuple or a struct that implements `FromRow`. The clauses are
+    /// the same as `get`.
+    ///
+    /// ```ignore
+    /// let titles = Post::query()
+    ///     .select(&["id", "title"])
+    ///     .get_as::<(i64, String)>(&db)
+    ///     .await?;
+    /// ```
+    pub async fn get_as<'a, T>(mut self, db: impl Executor<'a>) -> Result<Vec<T>, Error>
+    where
+        T: for<'r> FromRow<'r, MySqlRow> + Send + Unpin,
+    {
+        self.take_error()?;
+        self.rows::<T>(db, self.limit).await
+    }
+
+    /// Returns the first row decoded as `T`, in the order given by `order_by`. See `get_as`.
+    pub async fn first_as<'a, T>(mut self, db: impl Executor<'a>) -> Result<Option<T>, Error>
+    where
+        T: for<'r> FromRow<'r, MySqlRow> + Send + Unpin,
+    {
+        self.take_error()?;
+        let rows = self.rows::<T>(db, Some(1)).await?;
+        Ok(rows.into_iter().next())
+    }
+
     /// Returns the first row in the order given by `order_by`. Without `order_by` there is no
     /// order, as with Laravel's `first`, so call `order_by` when the row matters.
     pub async fn first<'a>(mut self, db: impl Executor<'a>) -> Result<Option<M>, Error> {
         self.take_error()?;
-        let rows = self.rows(db, Some(1)).await?;
+        let rows = self.rows::<M>(db, Some(1)).await?;
         Ok(rows.into_iter().next())
     }
 
@@ -473,7 +501,10 @@ impl<M: Model> Query<M> {
         if self.lock { " FOR UPDATE" } else { "" }
     }
 
-    async fn rows<'a>(&self, db: impl Executor<'a>, limit: Option<u64>) -> Result<Vec<M>, Error> {
+    async fn rows<'a, T>(&self, db: impl Executor<'a>, limit: Option<u64>) -> Result<Vec<T>, Error>
+    where
+        T: for<'r> FromRow<'r, MySqlRow> + Send + Unpin,
+    {
         let target = db.target();
         let lock = self.lock_clause();
         let columns = self.columns.as_deref().unwrap_or("*");
@@ -567,7 +598,7 @@ fn render(clauses: &[Clause], values: &mut Vec<Value>) -> String {
 }
 
 /// Runs a statement that changes rows, on the pool or on the transaction's connection.
-async fn execute(
+pub(crate) async fn execute(
     target: Target<'_>,
     sql: String,
     args: MySqlArguments,
@@ -588,13 +619,16 @@ async fn scalar(target: Target<'_>, sql: String, args: MySqlArguments) -> Result
     })
 }
 
-/// Runs a `SELECT` and maps its rows to the model, on the pool or on the transaction's connection.
-async fn fetch_rows<M: Model>(
+/// Runs a `SELECT` and maps its rows to `T`, on the pool or on the transaction's connection.
+pub(crate) async fn fetch_rows<T>(
     target: Target<'_>,
     sql: String,
     args: MySqlArguments,
-) -> Result<Vec<M>, Error> {
-    let query = sqlx::query_as_with::<_, M, _>(AssertSqlSafe(sql), args);
+) -> Result<Vec<T>, Error>
+where
+    T: for<'r> FromRow<'r, MySqlRow> + Send + Unpin,
+{
+    let query = sqlx::query_as_with::<_, T, _>(AssertSqlSafe(sql), args);
     Ok(match target {
         Target::Pool(pool) => query.fetch_all(pool).await?,
         Target::Transaction(conn) => query.fetch_all(conn).await?,

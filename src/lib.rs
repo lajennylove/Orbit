@@ -11,6 +11,7 @@ mod error;
 mod migrate;
 mod model;
 mod query;
+pub mod raw;
 mod transaction;
 mod value;
 
@@ -18,7 +19,7 @@ mod value;
 #[doc(hidden)]
 pub use sqlx as __sqlx;
 
-pub use database::Database;
+pub use database::{Database, PoolOptions};
 pub use error::Error;
 pub use migrate::{Migration, Migrator, State, Status};
 pub use model::Model;

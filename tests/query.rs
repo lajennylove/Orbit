@@ -58,6 +58,7 @@ model!(First, "orbit_query_first");
 model!(Get, "orbit_query_get");
 model!(Where, "orbit_query_where");
 model!(Count, "orbit_query_count");
+model!(Typed, "orbit_query_typed");
 model!(Insert, "orbit_query_insert");
 model!(Update, "orbit_query_update");
 model!(Delete, "orbit_query_delete");
@@ -646,5 +647,112 @@ async fn an_empty_group_adds_nothing_and_group_errors_surface() {
     assert!(matches!(err, Error::InvalidIdentifier(ref name) if name == "bad`column"));
 
     teardown(&db, GroupTwo::TABLE).await;
+    db.close().await;
+}
+
+/// A row of two columns, for a `select` that leaves out `views`.
+#[derive(Debug, PartialEq)]
+struct TitleOnly {
+    id: i64,
+    title: String,
+}
+
+impl<'r> FromRow<'r, MySqlRow> for TitleOnly {
+    fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            title: row.try_get("title")?,
+        })
+    }
+}
+
+#[tokio::test]
+async fn get_as_and_first_as_decode_a_partial_select() {
+    let Some(db) = connect().await else { return };
+    setup(&db, Typed::TABLE).await;
+    seed(
+        &db,
+        Typed::TABLE,
+        &[
+            row(1, "first", Some(10)),
+            row(2, "second", None),
+            row(3, "third", Some(30)),
+        ],
+    )
+    .await;
+
+    // A tuple of the selected columns, with the same clauses as get.
+    let pairs = Query::<Typed>::table()
+        .select(&["id", "title"])
+        .order_by("id", Direction::Asc)
+        .get_as::<(i64, String)>(&db)
+        .await
+        .expect("gets");
+    assert_eq!(
+        pairs,
+        vec![
+            (1, "first".to_owned()),
+            (2, "second".to_owned()),
+            (3, "third".to_owned())
+        ]
+    );
+
+    // A struct with only the selected fields, with where, order, limit and offset.
+    let page = Typed::query()
+        .select(&["id", "title"])
+        .where_op("id", Operator::Ge, 1)
+        .order_by("id", Direction::Asc)
+        .limit(2)
+        .offset(1)
+        .get_as::<TitleOnly>(&db)
+        .await
+        .expect("gets");
+    assert_eq!(
+        page,
+        vec![
+            TitleOnly {
+                id: 2,
+                title: "second".into()
+            },
+            TitleOnly {
+                id: 3,
+                title: "third".into()
+            },
+        ]
+    );
+
+    // first_as takes the first row in the order given, and None when nothing matches.
+    let last = Query::<Typed>::table()
+        .select(&["id", "title"])
+        .order_by("id", Direction::Desc)
+        .offset(1)
+        .first_as::<(i64, String)>(&db)
+        .await
+        .expect("finds");
+    assert_eq!(last, Some((2, "second".to_owned())));
+
+    let missing = Query::<Typed>::table()
+        .select(&["id", "title"])
+        .where_eq("id", 99)
+        .first_as::<TitleOnly>(&db)
+        .await
+        .expect("finds");
+    assert_eq!(missing, None);
+
+    // The lock applies to the typed calls too, inside a transaction.
+    let locked = db
+        .transaction(async |tx| {
+            Query::<Typed>::table()
+                .select(&["id", "title"])
+                .where_eq("id", 3)
+                .for_update()
+                .first_as::<(i64, String)>(&mut *tx)
+                .await
+        })
+        .await
+        .expect("locks");
+    assert_eq!(locked, Some((3, "third".to_owned())));
+
+    teardown(&db, Typed::TABLE).await;
     db.close().await;
 }

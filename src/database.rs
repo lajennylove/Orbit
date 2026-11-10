@@ -5,6 +5,28 @@ use sqlx::mysql::MySqlPoolOptions;
 
 use crate::{Error, Transaction};
 
+/// The settings for the connection pool, given to `Database::connect_with`. `Default` gives the
+/// settings that `Database::connect` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolOptions {
+    /// The most connections the pool opens at once. Further requests wait for one to be released.
+    pub max_connections: u32,
+    /// How long a request waits for a connection before it fails.
+    pub acquire_timeout: Duration,
+    /// The connections the pool keeps open while idle.
+    pub min_connections: u32,
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 5,
+            acquire_timeout: Duration::from_secs(10),
+            min_connections: 0,
+        }
+    }
+}
+
 /// The connection pool for one database. Clone-free: share it behind an `Arc` or in Rocket's state.
 #[derive(Debug)]
 pub struct Database {
@@ -14,9 +36,16 @@ pub struct Database {
 impl Database {
     /// Connects to the database at `url`, such as `mysql://user:password@host/database`.
     pub async fn connect(url: &str) -> Result<Self, Error> {
+        Self::connect_with(url, PoolOptions::default()).await
+    }
+
+    /// Connects to the database at `url` with the pool settings in `options`. `connect` uses
+    /// `PoolOptions::default()`.
+    pub async fn connect_with(url: &str, options: PoolOptions) -> Result<Self, Error> {
         let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(10))
+            .max_connections(options.max_connections)
+            .min_connections(options.min_connections)
+            .acquire_timeout(options.acquire_timeout)
             .connect(url)
             .await?;
         Ok(Self { pool })

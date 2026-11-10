@@ -1,3 +1,4 @@
+use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::Arguments;
 use sqlx::mysql::MySqlArguments;
 
@@ -12,6 +13,12 @@ pub enum Value {
     UInt(u64),
     Float(f64),
     Text(String),
+    /// A `DATETIME` or `TIMESTAMP`, with its microseconds.
+    DateTime(NaiveDateTime),
+    /// A `DATE`.
+    Date(NaiveDate),
+    /// Raw bytes, for `BLOB` columns. Use `Text` for strings.
+    Bytes(Vec<u8>),
 }
 
 impl From<bool> for Value {
@@ -62,6 +69,24 @@ impl From<String> for Value {
     }
 }
 
+impl From<NaiveDateTime> for Value {
+    fn from(value: NaiveDateTime) -> Self {
+        Self::DateTime(value)
+    }
+}
+
+impl From<NaiveDate> for Value {
+    fn from(value: NaiveDate) -> Self {
+        Self::Date(value)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Bytes(value)
+    }
+}
+
 impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(value: Option<T>) -> Self {
         value.map_or(Self::Null, Into::into)
@@ -79,6 +104,9 @@ pub(crate) fn bind(values: Vec<Value>) -> Result<MySqlArguments, Error> {
             Value::UInt(v) => args.add(v),
             Value::Float(v) => args.add(v),
             Value::Text(v) => args.add(v),
+            Value::DateTime(v) => args.add(v),
+            Value::Date(v) => args.add(v),
+            Value::Bytes(v) => args.add(v),
         };
         added.map_err(|e| Error::Database(sqlx::Error::Encode(e)))?;
     }

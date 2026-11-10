@@ -25,6 +25,23 @@ db.ping().await?;
 
 Call `db.close().await` to shut the connection pool down.
 
+`connect` opens at most 5 connections and waits up to 10 seconds for one. To change that, pass `PoolOptions` to `connect_with`. Fields you leave out keep their defaults:
+
+```rust
+use std::time::Duration;
+use orbit_orm::{Database, PoolOptions};
+
+let db = Database::connect_with(
+    "mysql://user:password@127.0.0.1/app",
+    PoolOptions {
+        max_connections: 10,
+        acquire_timeout: Duration::from_secs(5),
+        min_connections: 2,
+    },
+)
+.await?;
+```
+
 ## Models and queries
 
 A model maps a table to a Rust type and names the columns it may write. The `OrbitModel` derive writes the row mapping and the model from attributes. Without `table`, the table is the plural of the struct name, as in Laravel: `Flight` uses `flights`, `UserProfile` uses `user_profiles`.
@@ -84,7 +101,18 @@ let post = Post::query().find_or_fail(&db, 1).await?;
 let id = Query::<Post>::table().insert(&db, &[("title", "Hello".into())]).await?;
 ```
 
-Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`, `replace`. Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`.
+Methods: `get`, `first`, `first_or_fail`, `find`, `find_or_fail`, `count`, `exists`, `insert`, `update`, `delete`, `replace`, `get_as` and `first_as`.
+
+`get_as` and `first_as` take the same clauses as `get` and `first`, but decode each row as any type that implements sqlx's `FromRow`. With `select`, that reads only some columns, into a tuple or a struct with only those fields:
+
+```rust
+let titles = Post::query()
+    .select(&["id", "title"])
+    .order_by("id", Direction::Asc)
+    .get_as::<(i64, String)>(&db)
+    .await?;
+```
+ Filters: `where_eq`, `where_op`, `where_in`, `where_null`, `where_not_null`, and the `or_where_*` variants, which join with `OR`. Sorting and paging: `order_by`, `select`, `limit`, `offset`. Row locks: `for_update`.
 
 Conditions are grouped in parentheses with `where_group` and `or_where_group`:
 
@@ -107,6 +135,28 @@ let affected = Query::<Post>::table()
     .replace(&db, &[("title", "Hello".into())])
     .await?;
 ```
+
+## Timestamps and bytes
+
+`Value` has `DateTime(NaiveDateTime)`, `Date(NaiveDate)` and `Bytes(Vec<u8>)`, with `From` impls. They bind to `DATETIME` (with microseconds), `DATE` and `BLOB` columns, and the same types read back. A model field can use `NaiveDateTime`, `NaiveDate` or `Vec<u8>`:
+
+```rust
+use chrono::{NaiveDate, NaiveDateTime};
+
+let published = NaiveDateTime::parse_from_str("2026-11-10 18:35:07.123456", "%Y-%m-%d %H:%M:%S%.f")?;
+let id = Query::<Post>::table()
+    .insert(
+        &db,
+        &[
+            ("published_at", Value::from(published)),
+            ("day", Value::from(NaiveDate::from_ymd_opt(2026, 11, 10).unwrap())),
+            ("thumbnail", Value::from(vec![0x89, 0x50, 0x00])),
+        ],
+    )
+    .await?;
+```
+
+A `NaiveDateTime` has no time zone, and Orbit does not convert it.
 
 ## Blocking API
 
@@ -161,6 +211,32 @@ match Post::query().insert(&db, &[("title", "Hello".into())]).await {
 ```
 
 `UniqueViolation` and `ForeignKeyViolation` carry the index or constraint name when the server reports it. Other errors are `Error::Database`.
+
+## Raw SQL
+
+`orbit_orm::raw` runs SQL that the query builder does not cover. Each function takes `&db` or `&mut *tx`, as the terminal methods do:
+
+```rust
+use orbit_orm::{Value, raw};
+
+let changed = raw::execute(&db, "UPDATE posts SET views = views + 1 WHERE id = ?", &[Value::from(1)]).await?;
+let popular: Vec<(i64, String)> = raw::fetch_all(&db, "SELECT id, title FROM posts WHERE views >= ?", &[Value::from(100)]).await?;
+let post: Option<(i64, String)> = raw::fetch_optional(&db, "SELECT id, title FROM posts WHERE id = ?", &[Value::from(1)]).await?;
+let count: i64 = raw::fetch_scalar(&db, "SELECT COUNT(*) FROM posts", &[]).await?;
+```
+
+- `execute` returns the rows affected. `fetch_all` and `fetch_optional` decode each row as `T: FromRow`, and `fetch_scalar` decodes the first column of the first row. It is an error when no row comes back.
+- The SQL string is not escaped and is not checked. It must not contain user input. Put every value in the binds, in the order of the `?` placeholders.
+- `LAST_INSERT_ID()` belongs to one connection, so read it in the transaction that made the insert:
+
+```rust
+let id: u64 = db
+    .transaction(async |tx| {
+        raw::execute(&mut *tx, "INSERT INTO posts (title) VALUES (?)", &[Value::from("Hello")]).await?;
+        raw::fetch_scalar(&mut *tx, "SELECT LAST_INSERT_ID()", &[]).await
+    })
+    .await?;
+```
 
 ## Migrations
 
