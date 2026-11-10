@@ -1,0 +1,21 @@
+use sqlx::FromRow;
+use sqlx::mysql::MySqlRow;
+
+use crate::Query;
+
+/// A table and the Rust type that its rows map to. Written by hand for now; a derive comes later.
+pub trait Model: for<'r> FromRow<'r, MySqlRow> + Send + Unpin + Sized {
+    /// The table name.
+    const TABLE: &'static str;
+
+    /// The primary key, used by `find` and by the default order of `first`.
+    const PRIMARY_KEY: &'static str = "id";
+
+    /// The columns that `insert` and `update` may write. Empty by default, as in Laravel's `$fillable`.
+    const FILLABLE: &'static [&'static str] = &[];
+
+    /// Starts a query on the table.
+    fn query() -> Query<Self> {
+        Query::table()
+    }
+}

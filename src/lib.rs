@@ -6,6 +6,12 @@
 
 mod database;
 mod error;
+mod model;
+mod query;
+mod value;
 
 pub use database::Database;
 pub use error::Error;
+pub use model::Model;
+pub use query::{Direction, Operator, Query};
+pub use value::Value;
