@@ -5,7 +5,7 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
-use syn::{Data, DeriveInput, Error, Fields, Ident, LitStr, Result, parse_macro_input};
+use syn::{Data, DeriveInput, Error, Fields, Ident, LitStr, Result, Type, parse_macro_input};
 
 mod naming;
 
@@ -28,6 +28,7 @@ struct Options {
 /// One named field and the column it maps to.
 struct Column {
     ident: Ident,
+    ty: Type,
     name: String,
     skip: bool,
     fillable: bool,
@@ -98,12 +99,21 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2> {
         }
     });
     let fillable = columns.iter().filter(|c| c.fillable).map(|c| &c.name);
+    // Each mapped field must decode from the row's database, whichever one that is. This is the
+    // bound that sqlx's own `FromRow` derive emits, so one impl serves every enabled driver.
+    let decodes = columns.iter().filter(|c| !c.skip).map(|c| &c.ty);
 
     Ok(quote! {
-        impl<'r> ::orbit_orm::__sqlx::FromRow<'r, ::orbit_orm::__sqlx::mysql::MySqlRow> for #name {
-            fn from_row(
-                row: &'r ::orbit_orm::__sqlx::mysql::MySqlRow,
-            ) -> ::core::result::Result<Self, ::orbit_orm::__sqlx::Error> {
+        impl<'r, R> ::orbit_orm::__sqlx::FromRow<'r, R> for #name
+        where
+            R: ::orbit_orm::__sqlx::Row,
+            &'r ::core::primitive::str: ::orbit_orm::__sqlx::ColumnIndex<R>,
+            #(
+                #decodes: ::orbit_orm::__sqlx::Decode<'r, <R as ::orbit_orm::__sqlx::Row>::Database>
+                    + ::orbit_orm::__sqlx::Type<<R as ::orbit_orm::__sqlx::Row>::Database>,
+            )*
+        {
+            fn from_row(row: &'r R) -> ::core::result::Result<Self, ::orbit_orm::__sqlx::Error> {
                 ::core::result::Result::Ok(Self { #(#fields),* })
             }
         }
@@ -187,6 +197,7 @@ fn column(field: &syn::Field) -> Result<Column> {
     };
     Ok(Column {
         ident,
+        ty: field.ty.clone(),
         name,
         skip: skip.is_some(),
         fillable: fillable.is_some(),
