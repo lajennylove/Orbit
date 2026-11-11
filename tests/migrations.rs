@@ -1,7 +1,7 @@
 //! Runs migrations against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test
 //! database, such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The database tests are
-//! skipped with a notice when it is not set. They share the `migrations` table, so they take a
-//! lock and reset the tables first.
+//! skipped with a notice when it is not set. They share the `__diesel_schema_migrations` table,
+//! so they take a lock and reset the tables first.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +22,11 @@ fn fixture(set: &str) -> PathBuf {
         .join(set)
 }
 
+/// The version of a migration name: its 14-digit timestamp prefix.
+fn v(name: &str) -> String {
+    name[..14].to_string()
+}
+
 /// Connects, drops the tables the tests use, and holds the lock until the test ends. Returns
 /// `None` with a notice when `ORBIT_DATABASE_URL` is not set.
 async fn setup() -> Option<(MutexGuard<'static, ()>, Database)> {
@@ -31,19 +36,33 @@ async fn setup() -> Option<(MutexGuard<'static, ()>, Database)> {
     };
     let guard = LOCK.lock().await;
     let db = Database::connect(&url).await.expect("connects");
-    sqlx::raw_sql("DROP TABLE IF EXISTS migrations, widgets, gadgets, gizmos")
-        .execute(db.pool())
-        .await
-        .expect("drops the test tables");
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS __diesel_schema_migrations, migrations, widgets, gadgets, gizmos",
+    )
+    .execute(db.pool())
+    .await
+    .expect("drops the test tables");
     Some((guard, db))
 }
 
-/// The rows of the `migrations` table, as `(name, batch)` in name order.
+/// The rows of `__diesel_schema_migrations`, as `(version, batch)` in version order.
 async fn recorded(db: &Database) -> Vec<(String, i64)> {
-    sqlx::query_as("SELECT migration, batch FROM migrations ORDER BY migration")
+    sqlx::query_as("SELECT version, batch FROM __diesel_schema_migrations ORDER BY version")
         .fetch_all(db.pool())
         .await
         .expect("reads the migrations table")
+}
+
+/// The columns of `__diesel_schema_migrations`, in table order.
+async fn columns(db: &Database) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = '__diesel_schema_migrations' \
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("reads the columns")
 }
 
 async fn table_exists(db: &Database, table: &str) -> bool {
@@ -74,11 +93,7 @@ async fn run_applies_all_in_order_and_records_one_batch() {
     assert_eq!(names, [WIDGETS, GADGETS, COLOR]);
     assert_eq!(
         recorded(&db).await,
-        [
-            (WIDGETS.to_string(), 1),
-            (GADGETS.to_string(), 1),
-            (COLOR.to_string(), 1),
-        ]
+        [(v(WIDGETS), 1), (v(GADGETS), 1), (v(COLOR), 1)]
     );
     assert!(table_exists(&db, "gadgets").await);
 }
@@ -147,7 +162,7 @@ async fn rollback_reverts_the_last_batch_only() {
 
     let reverted = full.rollback(&db).await.expect("rolls back batch 2");
     assert_eq!(reverted, [COLOR, GADGETS], "reverse order within the batch");
-    assert_eq!(recorded(&db).await, [(WIDGETS.to_string(), 1)]);
+    assert_eq!(recorded(&db).await, [(v(WIDGETS), 1)]);
     assert!(
         !table_exists(&db, "gadgets").await,
         "down.sql dropped gadgets"
@@ -180,14 +195,16 @@ async fn a_failing_migration_stops_the_run_and_names_it() {
     assert!(error.to_string().contains("20260102000000_broken"));
 
     // The first migration stays applied in the batch. The third never runs.
-    assert_eq!(recorded(&db).await, [(WIDGETS.to_string(), 1)]);
+    assert_eq!(recorded(&db).await, [(v(WIDGETS), 1)]);
     assert!(!table_exists(&db, "gadgets").await);
     // MySQL commits the CREATE TABLE before the failing statement, so gizmos is left behind.
     assert!(table_exists(&db, "gizmos").await);
 }
 
+/// (a) A fresh database gets Diesel's table, with `version`, `run_on` and `batch`, and no
+/// `migrations` table.
 #[tokio::test]
-async fn the_migrations_table_is_created_on_first_use() {
+async fn a_fresh_database_gets_the_diesel_table_with_a_batch_column() {
     let Some((_lock, db)) = setup().await else {
         return;
     };
@@ -198,13 +215,141 @@ async fn the_migrations_table_is_created_on_first_use() {
         .status(&db)
         .await
         .expect("status creates the table");
-    assert!(table_exists(&db, "migrations").await);
 
-    // Running again must not fail on the existing table.
+    assert!(table_exists(&db, "__diesel_schema_migrations").await);
+    assert!(
+        !table_exists(&db, "migrations").await,
+        "no Laravel-named table"
+    );
+    assert_eq!(columns(&db).await, ["version", "run_on", "batch"]);
+
+    let types: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT column_name, column_type, is_nullable, column_key FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = '__diesel_schema_migrations' \
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("reads the column types");
+    assert_eq!(types[0].0, "version");
+    assert_eq!(types[0].1, "varchar(50)");
+    assert_eq!(types[0].2, "NO");
+    assert_eq!(types[0].3, "PRI");
+    assert_eq!(types[1].0, "run_on");
+    assert!(
+        types[1].1.starts_with("timestamp"),
+        "run_on is {}",
+        types[1].1
+    );
+    assert_eq!(types[1].2, "NO");
+    assert_eq!(types[2].0, "batch");
+    assert!(types[2].1.starts_with("int"), "batch is {}", types[2].1);
+    assert_eq!(types[2].2, "NO");
+
+    // Running again must not fail on the existing table, or add the column twice.
     migrator
         .status(&db)
         .await
         .expect("the table already exists");
+    assert_eq!(columns(&db).await, ["version", "run_on", "batch"]);
+}
+
+/// (b) A database with Diesel's layout (`version` and `run_on` only, two rows) is upgraded in place
+/// by `ensure_table`: `batch` is added and the rows are batch 0. `run` then applies only the
+/// missing migration, as batch 1.
+#[tokio::test]
+async fn a_diesel_table_is_upgraded_in_place_and_run_applies_only_the_missing() {
+    let Some((_lock, db)) = setup().await else {
+        return;
+    };
+    sqlx::raw_sql(
+        "CREATE TABLE __diesel_schema_migrations (\
+             version VARCHAR(50) NOT NULL PRIMARY KEY, \
+             run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+         INSERT INTO __diesel_schema_migrations (version, run_on) VALUES \
+             ('20260101000000', '2026-01-05 10:00:00'), \
+             ('20260102000000', '2026-01-05 10:00:00');\
+         CREATE TABLE widgets (\
+             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             name VARCHAR(255) NOT NULL);\
+         CREATE TABLE gadgets (\
+             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);",
+    )
+    .execute(db.pool())
+    .await
+    .expect("creates Diesel's table and the fixture schema");
+    let migrator = Migrator::from_dir(fixture("full")).expect("reads the fixtures");
+
+    // Any call runs ensure_table. status is the one that only reads.
+    let status = migrator.status(&db).await.expect("reads the status");
+    assert_eq!(columns(&db).await, ["version", "run_on", "batch"]);
+    assert_eq!(
+        recorded(&db).await,
+        [(v(WIDGETS), 0), (v(GADGETS), 0)],
+        "Diesel's rows are batch 0"
+    );
+    assert_eq!(status[0].state, applied(0));
+    assert_eq!(status[1].state, applied(0));
+    assert_eq!(status[2].state, State::Pending);
+    let run_on: Vec<String> = sqlx::query_scalar(
+        "SELECT CAST(run_on AS CHAR) FROM __diesel_schema_migrations ORDER BY version",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("reads run_on");
+    assert_eq!(run_on, ["2026-01-05 10:00:00", "2026-01-05 10:00:00"]);
+
+    let names = migrator.run(&db).await.expect("runs the missing migration");
+    assert_eq!(names, [COLOR], "only the migration Diesel did not record");
+    assert_eq!(
+        recorded(&db).await,
+        [(v(WIDGETS), 0), (v(GADGETS), 0), (v(COLOR), 1)]
+    );
+}
+
+/// (c) After (b), a rollback reverts only the batch-1 migration and leaves Diesel's rows.
+#[tokio::test]
+async fn rollback_after_the_upgrade_reverts_only_the_new_batch() {
+    let Some((_lock, db)) = setup().await else {
+        return;
+    };
+    sqlx::raw_sql(
+        "CREATE TABLE __diesel_schema_migrations (\
+             version VARCHAR(50) NOT NULL PRIMARY KEY, \
+             run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+         INSERT INTO __diesel_schema_migrations (version) VALUES \
+             ('20260101000000'), ('20260102000000');\
+         CREATE TABLE widgets (\
+             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             name VARCHAR(255) NOT NULL);\
+         CREATE TABLE gadgets (\
+             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);",
+    )
+    .execute(db.pool())
+    .await
+    .expect("creates Diesel's table and the fixture schema");
+    let migrator = Migrator::from_dir(fixture("full")).expect("reads the fixtures");
+    migrator
+        .run(&db)
+        .await
+        .expect("upgrades, then runs batch 1");
+
+    let reverted = migrator.rollback(&db).await.expect("rolls back batch 1");
+    assert_eq!(reverted, [COLOR]);
+    assert_eq!(recorded(&db).await, [(v(WIDGETS), 0), (v(GADGETS), 0)]);
+    assert!(
+        table_exists(&db, "widgets").await,
+        "Diesel's migrations stay applied"
+    );
+    assert!(table_exists(&db, "gadgets").await);
+    let color_gone: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = 'widgets' AND column_name = 'color'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("reads information_schema");
+    assert_eq!(color_gone, 0, "down.sql dropped the color column");
 }
 
 #[test]

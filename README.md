@@ -255,9 +255,9 @@ migrator.rollback(&db).await?;             // reverts the last batch, in reverse
 
 `migrations!("migrations", "20261108000000_create_users")` embeds the files in the binary at build time. List the names by hand; a missing file is a build error.
 
-To move from Diesel, `import_diesel_history` records the migrations that Diesel already applied, from its `__diesel_schema_migrations` table, without running any `up.sql`. `unmatched_diesel_versions` lists the Diesel versions that have no folder in the migrator.
+Migrations are recorded in Diesel's `__diesel_schema_migrations` table, so a database that Diesel migrated keeps its history. `import_diesel_history` adds the `batch` column to a table that has only Diesel's columns, and returns nothing. `unmatched_diesel_versions` lists the versions in the table that have no folder in the migrator.
 
-Migrations are recorded in the `migrations` table with their batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
+Each recorded migration has its batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
 
 `run` and `rollback` hold the MySQL lock `orbit_migrations`. A second process waits up to 10 seconds, then fails with `MigrationsLocked`. Change the wait with `Migrator::with_lock_timeout`.
 

@@ -1,6 +1,6 @@
 //! Migrations are SQL folders that change the schema. Each folder is named `<timestamp>_<name>`
-//! and holds `up.sql` and `down.sql`. Like Laravel's migrator, the applied ones are recorded in a
-//! `migrations` table with a batch number, and a rollback reverts the last batch.
+//! and holds `up.sql` and `down.sql`. The applied ones are recorded in Diesel's
+//! `__diesel_schema_migrations` table with a batch number, and a rollback reverts the last batch.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -57,9 +57,6 @@ pub struct Migrator {
 
 /// The name of the MySQL lock that serialises `run` and `rollback` across processes.
 const LOCK_NAME: &str = "orbit_migrations";
-
-/// The table that Diesel records its applied migrations in.
-const DIESEL_TABLE: &str = "__diesel_schema_migrations";
 
 /// How long `run` and `rollback` wait for another process's lock before giving up.
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -152,15 +149,17 @@ impl Migrator {
         let pending: Vec<&Migration> = self
             .migrations
             .iter()
-            .filter(|m| !applied.contains_key(&m.name))
+            .filter(|m| !applied.contains_key(timestamp(&m.name)))
             .collect();
         if pending.is_empty() {
             return Ok(Vec::new());
         }
 
-        let batch: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(batch), 0) + 1 FROM migrations")
-            .fetch_one(db.pool())
-            .await?;
+        let batch: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(batch), 0) + 1 FROM __diesel_schema_migrations",
+        )
+        .fetch_one(db.pool())
+        .await?;
         let mut names = Vec::with_capacity(pending.len());
         for migration in pending {
             let mut tx = db.pool().begin().await?;
@@ -171,8 +170,8 @@ impl Migrator {
                     name: migration.name.clone(),
                     source,
                 })?;
-            sqlx::query("INSERT INTO migrations (migration, batch) VALUES (?, ?)")
-                .bind(&migration.name)
+            sqlx::query("INSERT INTO __diesel_schema_migrations (version, batch) VALUES (?, ?)")
+                .bind(timestamp(&migration.name))
                 .bind(batch)
                 .execute(&mut *tx)
                 .await
@@ -196,7 +195,7 @@ impl Migrator {
             .iter()
             .map(|m| Status {
                 name: m.name.clone(),
-                state: match applied.get(&m.name) {
+                state: match applied.get(timestamp(&m.name)) {
                     Some(&batch) => State::Applied { batch },
                     None => State::Pending,
                 },
@@ -208,6 +207,9 @@ impl Migrator {
     /// transaction. It checks that every migration in the batch has files here before it reverts
     /// anything. Returns the names that were reverted, or nothing when no migration has run.
     ///
+    /// Batch 0 holds the history that Diesel recorded, so a rollback that reaches batch 0 reverts
+    /// those migrations and removes their rows from Diesel's table too.
+    ///
     /// As with [`run`](Self::run), DDL in a `down.sql` is not rolled back by MySQL.
     pub async fn rollback(&self, db: &Database) -> Result<Vec<String>, Error> {
         self.with_lock(db, self.rollback_unlocked(db)).await
@@ -215,28 +217,32 @@ impl Migrator {
 
     async fn rollback_unlocked(&self, db: &Database) -> Result<Vec<String>, Error> {
         ensure_table(db).await?;
-        let last: Option<i64> = sqlx::query_scalar("SELECT MAX(batch) FROM migrations")
-            .fetch_one(db.pool())
-            .await?;
+        let last: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(batch) FROM __diesel_schema_migrations")
+                .fetch_one(db.pool())
+                .await?;
         let Some(batch) = last else {
             return Ok(Vec::new());
         };
-        let names: Vec<String> = sqlx::query_scalar(
-            "SELECT migration FROM migrations WHERE batch = ? ORDER BY migration DESC",
+        let versions: Vec<String> = sqlx::query_scalar(
+            "SELECT version FROM __diesel_schema_migrations WHERE batch = ? ORDER BY version DESC",
         )
         .bind(batch)
         .fetch_all(db.pool())
         .await?;
 
-        let mut to_revert = Vec::with_capacity(names.len());
-        for name in &names {
+        let mut to_revert = Vec::with_capacity(versions.len());
+        for version in &versions {
             let migration = self
                 .migrations
                 .iter()
-                .find(|m| &m.name == name)
-                .ok_or_else(|| Error::UnknownMigration { name: name.clone() })?;
+                .find(|m| timestamp(&m.name) == version.as_str())
+                .ok_or_else(|| Error::UnknownMigration {
+                    name: version.clone(),
+                })?;
             to_revert.push(migration);
         }
+        let names = to_revert.iter().map(|m| m.name.clone()).collect();
         for migration in to_revert {
             let mut tx = db.pool().begin().await?;
             sqlx::raw_sql(AssertSqlSafe(migration.down.as_str()))
@@ -246,8 +252,8 @@ impl Migrator {
                     name: migration.name.clone(),
                     source,
                 })?;
-            sqlx::query("DELETE FROM migrations WHERE migration = ?")
-                .bind(&migration.name)
+            sqlx::query("DELETE FROM __diesel_schema_migrations WHERE version = ?")
+                .bind(timestamp(&migration.name))
                 .execute(&mut *tx)
                 .await
                 .map_err(|source| Error::RollbackFailed {
@@ -261,55 +267,20 @@ impl Migrator {
 }
 
 impl Migrator {
-    /// Records the migrations that Diesel already applied, so this migrator sees them as applied.
-    /// A migration is imported when its timestamp is in Diesel's `__diesel_schema_migrations`
-    /// table and it is not recorded here yet. They all go in one new batch, in name order. No
-    /// `up.sql` runs, and Diesel's table is not changed. Returns the names imported, so a second
-    /// call returns nothing. Diesel versions with no migration here are not imported; see
-    /// [`unmatched_diesel_versions`](Self::unmatched_diesel_versions).
-    ///
-    /// Returns nothing when Diesel's table does not exist.
+    /// Brings Diesel's history into this migrator's table. Orbit and Diesel share
+    /// `__diesel_schema_migrations`, so the rows Diesel wrote are already the applied history, in
+    /// batch 0. This call does what is still needed for them: it adds the `batch` column to a
+    /// table that has only Diesel's columns. No `up.sql` runs, and no row is added or changed.
+    /// It returns nothing, because there is nothing new to record. It is safe to call again.
     pub async fn import_diesel_history(&self, db: &Database) -> Result<Vec<String>, Error> {
-        self.with_lock(db, self.import_unlocked(db)).await
+        self.with_lock(db, import_unlocked(db)).await
     }
 
-    async fn import_unlocked(&self, db: &Database) -> Result<Vec<String>, Error> {
-        ensure_table(db).await?;
-        let Some(versions) = diesel_versions(db).await? else {
-            return Ok(Vec::new());
-        };
-        let applied = applied(db).await?;
-        let pending: Vec<&Migration> = self
-            .migrations
-            .iter()
-            .filter(|m| versions.contains(timestamp(&m.name)) && !applied.contains_key(&m.name))
-            .collect();
-        if pending.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let batch: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(batch), 0) + 1 FROM migrations")
-            .fetch_one(db.pool())
-            .await?;
-        let mut names = Vec::with_capacity(pending.len());
-        for migration in pending {
-            let mut tx = db.pool().begin().await?;
-            sqlx::query("INSERT INTO migrations (migration, batch) VALUES (?, ?)")
-                .bind(&migration.name)
-                .bind(batch)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-            names.push(migration.name.clone());
-        }
-        Ok(names)
-    }
-
-    /// The versions in Diesel's table that have no migration in this migrator, in order. They are
-    /// left out of [`import_diesel_history`](Self::import_diesel_history), so the caller decides
-    /// what to do with them. Empty when Diesel's table does not exist.
+    /// The versions in the migrations table that have no migration in this migrator, in order.
+    /// They include versions that Orbit recorded when a folder has since been removed. Empty when
+    /// the table does not exist. Only reads the table.
     pub async fn unmatched_diesel_versions(&self, db: &Database) -> Result<Vec<String>, Error> {
-        let Some(versions) = diesel_versions(db).await? else {
+        let Some(versions) = recorded_versions(db).await? else {
             return Ok(Vec::new());
         };
         let mut unmatched: Vec<String> = versions
@@ -383,45 +354,87 @@ impl Migrator {
     }
 }
 
+/// The body of [`Migrator::import_diesel_history`], run under the lock.
+async fn import_unlocked(db: &Database) -> Result<Vec<String>, Error> {
+    ensure_table(db).await?;
+    Ok(Vec::new())
+}
+
 /// Whether the name starts with a 14-digit timestamp and an underscore, followed by a name.
 fn has_timestamp(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() > 15 && bytes[..14].iter().all(u8::is_ascii_digit) && bytes[14] == b'_'
 }
 
-/// The timestamp of a name that passed `has_timestamp`.
+/// The timestamp of a name that passed `has_timestamp`. It is the `version` in the table.
 fn timestamp(name: &str) -> &str {
     &name[..14]
 }
 
-/// Creates the `migrations` table if it does not exist yet.
+/// Creates `__diesel_schema_migrations` in Diesel's layout if it does not exist, with Orbit's
+/// `batch` column. A table that Diesel created has `version` and `run_on` only. For that table
+/// the `batch` column is added, and its existing rows get batch 0, so they count as one batch
+/// that was imported from Diesel. Nothing is dropped or renamed. Safe to run on every call.
 async fn ensure_table(db: &Database) -> Result<(), Error> {
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS migrations (\
-         migration VARCHAR(255) NOT NULL PRIMARY KEY, \
-         batch INT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (\
+         version VARCHAR(50) NOT NULL PRIMARY KEY, \
+         run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+         batch INT NOT NULL DEFAULT 0)",
     )
     .execute(db.pool())
     .await?;
-    Ok(())
+    if has_batch_column(db).await? {
+        return Ok(());
+    }
+    let added = sqlx::query(
+        "ALTER TABLE __diesel_schema_migrations ADD COLUMN batch INT NOT NULL DEFAULT 0",
+    )
+    .execute(db.pool())
+    .await;
+    match added {
+        Ok(_) => Ok(()),
+        // Another process added the column after the check above.
+        Err(err) if is_duplicate_column(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
-/// The recorded migrations, with their batch numbers.
+/// Whether the migrations table has a `batch` column.
+async fn has_batch_column(db: &Database) -> Result<bool, Error> {
+    let found: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = '__diesel_schema_migrations' \
+         AND column_name = 'batch'",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    Ok(found > 0)
+}
+
+/// MySQL error 1060, `ER_DUP_FIELDNAME`: the column already exists.
+fn is_duplicate_column(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|db_err| db_err.code())
+        .is_some_and(|code| code == "1060")
+}
+
+/// The applied migrations, keyed by version, with their batch numbers.
 async fn applied(db: &Database) -> Result<HashMap<String, i64>, Error> {
-    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT migration, batch FROM migrations")
-        .fetch_all(db.pool())
-        .await?;
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT version, batch FROM __diesel_schema_migrations")
+            .fetch_all(db.pool())
+            .await?;
     Ok(rows.into_iter().collect())
 }
 
-/// The versions in Diesel's `__diesel_schema_migrations` table, or `None` when it does not exist.
-/// Only reads the table.
-async fn diesel_versions(db: &Database) -> Result<Option<HashSet<String>>, Error> {
+/// The versions in `__diesel_schema_migrations`, or `None` when the table does not exist. Only
+/// reads the table.
+async fn recorded_versions(db: &Database) -> Result<Option<HashSet<String>>, Error> {
     let found: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables \
-         WHERE table_schema = DATABASE() AND table_name = ?",
+         WHERE table_schema = DATABASE() AND table_name = '__diesel_schema_migrations'",
     )
-    .bind(DIESEL_TABLE)
     .fetch_one(db.pool())
     .await?;
     if found == 0 {
