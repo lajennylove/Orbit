@@ -38,7 +38,7 @@ The database is chosen by the URL's scheme. A scheme whose feature is not enable
 | PostgreSQL | `postgres://user:password@host:5432/database`    |
 | SQLite     | `sqlite:///absolute/path/app.db?mode=rwc`, or `sqlite://relative/app.db?mode=rwc` |
 
-`mode=rwc` creates the SQLite file when it does not exist. `sqlite::memory:` is an in-memory database, one per connection.
+`mode=rwc` creates the SQLite file when it does not exist. A PostgreSQL URL must name the user: without one, sqlx connects as the role `anonymous`, which usually does not exist. `sqlite::memory:` is an in-memory database, one per connection.
 
 MySQL:
 
