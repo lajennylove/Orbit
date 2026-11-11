@@ -110,6 +110,7 @@ async fn table_exists(db: &Database, table: &str) -> bool {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // Exercises the deprecated import_diesel_history on purpose.
 async fn import_upgrades_diesel_table_and_records_nothing_new() {
     let Some((_guard, db)) = setup().await else {
         return;
@@ -148,6 +149,7 @@ async fn import_upgrades_diesel_table_and_records_nothing_new() {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // Exercises the deprecated import_diesel_history on purpose.
 async fn a_second_import_changes_nothing() {
     let Some((_guard, db)) = setup().await else {
         return;
@@ -209,6 +211,7 @@ async fn a_version_that_diesel_writes_later_counts_as_applied() {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // Exercises the deprecated import_diesel_history on purpose.
 async fn versions_without_a_folder_are_listed_and_not_imported() {
     let Some((_guard, db)) = setup().await else {
         return;
@@ -236,6 +239,7 @@ async fn versions_without_a_folder_are_listed_and_not_imported() {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // Exercises the deprecated import_diesel_history on purpose.
 async fn without_a_table_the_import_creates_it_and_records_nothing() {
     let Some((_guard, db)) = setup().await else {
         return;

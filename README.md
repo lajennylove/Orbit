@@ -255,7 +255,7 @@ migrator.rollback(&db).await?;             // reverts the last batch, in reverse
 
 `migrations!("migrations", "20261108000000_create_users")` embeds the files in the binary at build time. List the names by hand; a missing file is a build error.
 
-Migrations are recorded in Diesel's `__diesel_schema_migrations` table, so a database that Diesel migrated keeps its history. `import_diesel_history` adds the `batch` column to a table that has only Diesel's columns, and returns nothing. `unmatched_diesel_versions` lists the versions in the table that have no folder in the migrator.
+Migrations are recorded in Diesel's `__diesel_schema_migrations` table, so a database that Diesel migrated keeps its history. `run`, `status` and `rollback` add the `batch` column to a table that has only Diesel's columns, so nothing needs to be imported first. `unmatched_diesel_versions` lists the versions in the table that have no folder in the migrator.
 
 Each recorded migration has its batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
 

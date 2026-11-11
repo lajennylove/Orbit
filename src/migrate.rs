@@ -273,6 +273,11 @@ impl Migrator {
     /// batch 0. This call does what is still needed for them: it adds the `batch` column to a
     /// table that has only Diesel's columns. No `up.sql` runs, and no row is added or changed.
     /// It returns nothing, because there is nothing new to record. It is safe to call again.
+    #[deprecated(
+        since = "0.1.1",
+        note = "not needed any more: run, status and rollback upgrade the migrations table \
+                themselves. This returns an empty list and will be removed in a later release"
+    )]
     pub async fn import_diesel_history(&self, db: &Database) -> Result<Vec<String>, Error> {
         self.with_lock(db, import_unlocked(db)).await
     }

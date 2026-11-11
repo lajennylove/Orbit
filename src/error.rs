@@ -65,9 +65,12 @@ pub enum Error {
     #[error("migration `{name}` failed to roll back: {source}")]
     RollbackFailed { name: String, source: sqlx::Error },
 
-    /// A migration is recorded as applied, but this migrator has no files for it, so it cannot
-    /// be rolled back.
-    #[error("migration `{name}` is applied but has no files here, so it cannot be rolled back")]
+    /// A migration is recorded as applied, but this migrator has no folder for it, so it cannot
+    /// be rolled back. `name` is the version: the 14-digit timestamp prefix recorded in the table.
+    #[error(
+        "migration version `{name}` was recorded as applied, but no folder with that version \
+         exists in this migrator, so it cannot be rolled back"
+    )]
     UnknownMigration { name: String },
 
     /// A table or column name is empty or contains a backtick.
