@@ -5,7 +5,7 @@ Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB, PostgreSQL 
 ## Install
 
 ```sh
-cargo add orbit-orm --git https://github.com/lajennylove/Orbit
+cargo add orbit-orm
 ```
 
 Each database is a Cargo feature. `mysql` is on by default; enable the others, or turn `mysql` off:
@@ -17,14 +17,14 @@ Each database is a Cargo feature. `mysql` is on by default; enable the others, o
 | `sqlite`   | SQLite (file or memory)      | no      |
 
 ```sh
-cargo add orbit-orm --features postgres,sqlite --git https://github.com/lajennylove/Orbit
-cargo add orbit-orm --no-default-features --features sqlite --git https://github.com/lajennylove/Orbit
+cargo add orbit-orm --features postgres
+cargo add orbit-orm --no-default-features --features sqlite,derive
 ```
 
 For the synchronous API, also enable the `blocking` feature:
 
 ```sh
-cargo add orbit-orm --features blocking --git https://github.com/lajennylove/Orbit
+cargo add orbit-orm --features blocking
 ```
 
 ## Connect
