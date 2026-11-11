@@ -1,6 +1,6 @@
 # The blocking API
 
-`orbit_orm::blocking` (feature `blocking`) is a synchronous API over the same queries as the async one. Laravel has no blocking or async split, since PHP is synchronous, so there is no Laravel behaviour to match here.
+`orbit_orm::blocking` (feature `blocking`) is a synchronous API over the same queries as the async one. It works on every database that the build enables, and each database behaves as in the async API: see [laravel-differences.md](laravel-differences.md#differences-between-databases). Laravel has no blocking or async split, since PHP is synchronous, so there is no Laravel behaviour to match here.
 
 ## How it runs
 
@@ -26,7 +26,7 @@ Nothing is committed on a panic. Writes made before the panic are not visible af
 
 ## Tested cases
 
-The cases are in `tests/blocking.rs`. They run against MySQL or MariaDB when `ORBIT_DATABASE_URL` is set, and are skipped with a notice otherwise.
+The cases are in `tests/blocking.rs`. They run against the database that `ORBIT_DATABASE_URL` names, on MySQL and MariaDB, PostgreSQL and SQLite, and are skipped with a notice when it is not set.
 
 - `transaction_commits_when_the_closure_returns_ok`: a committed row is visible afterwards.
 - `transaction_rolls_back_when_the_closure_returns_err`: the `Err` is returned, and the row is gone.

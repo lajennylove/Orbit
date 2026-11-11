@@ -1,6 +1,6 @@
 # orbit-orm
 
-Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB today.
+Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB, PostgreSQL and SQLite.
 
 ## Install
 
@@ -8,7 +8,20 @@ Orbit is an ORM for Rocket.rs apps. It works with MySQL and MariaDB today.
 cargo add orbit-orm --git https://github.com/lajennylove/Orbit
 ```
 
-For the synchronous API, enable the `blocking` feature:
+Each database is a Cargo feature. `mysql` is on by default; enable the others, or turn `mysql` off:
+
+| Feature    | Database                     | Default |
+|------------|------------------------------|---------|
+| `mysql`    | MySQL and MariaDB            | yes     |
+| `postgres` | PostgreSQL                   | no      |
+| `sqlite`   | SQLite (file or memory)      | no      |
+
+```sh
+cargo add orbit-orm --features postgres,sqlite --git https://github.com/lajennylove/Orbit
+cargo add orbit-orm --no-default-features --features sqlite --git https://github.com/lajennylove/Orbit
+```
+
+For the synchronous API, also enable the `blocking` feature:
 
 ```sh
 cargo add orbit-orm --features blocking --git https://github.com/lajennylove/Orbit
@@ -16,10 +29,41 @@ cargo add orbit-orm --features blocking --git https://github.com/lajennylove/Orb
 
 ## Connect
 
+The database is chosen by the URL's scheme. A scheme whose feature is not enabled is an error.
+
+| Database   | URL                                              |
+|------------|--------------------------------------------------|
+| MySQL      | `mysql://user:password@host:3306/database`       |
+| MariaDB    | `mariadb://user:password@host:3306/database`     |
+| PostgreSQL | `postgres://user:password@host:5432/database`    |
+| SQLite     | `sqlite:///absolute/path/app.db?mode=rwc`, or `sqlite://relative/app.db?mode=rwc` |
+
+`mode=rwc` creates the SQLite file when it does not exist. `sqlite::memory:` is an in-memory database, one per connection.
+
+MySQL:
+
 ```rust
 use orbit_orm::Database;
 
 let db = Database::connect("mysql://user:password@127.0.0.1/app").await?;
+db.ping().await?;
+```
+
+PostgreSQL:
+
+```rust
+use orbit_orm::Database;
+
+let db = Database::connect("postgres://user:password@127.0.0.1/app").await?;
+db.ping().await?;
+```
+
+SQLite:
+
+```rust
+use orbit_orm::Database;
+
+let db = Database::connect("sqlite:///var/lib/app/app.db?mode=rwc").await?;
 db.ping().await?;
 ```
 
@@ -259,17 +303,19 @@ Migrations are recorded in Diesel's `__diesel_schema_migrations` table, so a dat
 
 Each recorded migration has its batch number. Each migration runs in its own transaction. MySQL does not roll back DDL, so a failing migration can leave the DDL it ran before the failure in place; only its DML is rolled back.
 
-`run` and `rollback` hold the MySQL lock `orbit_migrations`. A second process waits up to 10 seconds, then fails with `MigrationsLocked`. Change the wait with `Migrator::with_lock_timeout`.
+`run` and `rollback` hold a lock named after the database: a named lock on MySQL, an advisory lock on PostgreSQL. A second process waits up to 10 seconds, then fails with `MigrationsLocked`. Change the wait with `Migrator::with_lock_timeout`. SQLite has no named lock, so its lock covers one process only; see [docs/laravel-differences.md](docs/laravel-differences.md).
 
 ## Tests
 
-The database tests need a MySQL or MariaDB test database:
+The database tests run against the database that `ORBIT_DATABASE_URL` names. Run them once per database, with the matching feature:
 
 ```sh
 ORBIT_DATABASE_URL='mysql://user:password@127.0.0.1:3306/orbit_test' cargo test
+ORBIT_DATABASE_URL='postgres://user:password@127.0.0.1:5432/orbit_test' cargo test --no-default-features --features postgres
+ORBIT_DATABASE_URL='sqlite:///tmp/orbit_test.db?mode=rwc' cargo test --no-default-features --features sqlite
 ```
 
-Without `ORBIT_DATABASE_URL`, the database tests are skipped.
+Without `ORBIT_DATABASE_URL`, the database tests are skipped. The tests create and drop their own tables.
 
 ## Differences from Laravel
 
