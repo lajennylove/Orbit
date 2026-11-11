@@ -17,7 +17,6 @@ use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
-use sqlx::MySqlPool;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::{Error, Model, Value};
@@ -50,8 +49,18 @@ impl Database {
         }
     }
 
-    /// The underlying pool, for queries that Orbit does not wrap yet. Run them with `run`.
-    pub fn pool(&self) -> &MySqlPool {
+    /// The database this pool talks to.
+    pub fn driver(&self) -> crate::Driver {
+        self.inner.driver()
+    }
+
+    /// The MySQL pool, for queries that Orbit does not wrap yet. Run them with `run`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the database is not MySQL. See `crate::Database::pool`.
+    #[cfg(feature = "mysql")]
+    pub fn pool(&self) -> &sqlx::MySqlPool {
         self.inner.pool()
     }
 
@@ -73,7 +82,7 @@ impl Database {
         E: From<Error>,
         F: FnOnce(&mut Transaction) -> Result<T, E>,
     {
-        let inner = self.run(crate::Transaction::begin(self.inner.pool()))??;
+        let inner = self.run(crate::Transaction::begin(&self.inner.pool))??;
         let mut tx = Transaction {
             inner,
             runtime: Arc::clone(self.runtime_arc()),

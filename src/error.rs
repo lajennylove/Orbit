@@ -1,12 +1,21 @@
 use std::path::PathBuf;
 
 use sqlx::error::ErrorKind;
+#[cfg(feature = "mysql")]
 use sqlx::mysql::MySqlDatabaseError;
 
 /// MySQL error 1205: a lock was not released within `innodb_lock_wait_timeout`.
+#[cfg(feature = "mysql")]
 const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 /// MySQL error 1213: the database rolled back the transaction to break a deadlock.
+#[cfg(feature = "mysql")]
 const ER_LOCK_DEADLOCK: u16 = 1213;
+/// PostgreSQL SQLSTATE 40P01: the database rolled back the transaction to break a deadlock.
+#[cfg(feature = "postgres")]
+const PG_DEADLOCK_DETECTED: &str = "40P01";
+/// PostgreSQL SQLSTATE 55P03: `lock_not_available`, a `NOWAIT` or `lock_timeout` lock failed.
+#[cfg(feature = "postgres")]
+const PG_LOCK_NOT_AVAILABLE: &str = "55P03";
 
 /// Any error from Orbit. Driver errors that have a variant here are classified; the rest come
 /// through unchanged as `Database`.
@@ -73,9 +82,27 @@ pub enum Error {
     )]
     UnknownMigration { name: String },
 
-    /// A table or column name is empty or contains a backtick.
-    #[error("invalid identifier `{0}`: names must not be empty or contain a backtick")]
+    /// A table or column name is empty or contains a quote character (a backtick or a double
+    /// quote). The same rule applies to every database.
+    #[error(
+        "invalid identifier `{0}`: names must not be empty or contain a backtick or a double quote"
+    )]
     InvalidIdentifier(String),
+
+    /// The URL's scheme names a database whose Cargo feature is not enabled, or no database.
+    /// `scheme` is the part before the first `:`, never the password.
+    #[error(
+        "database URL scheme `{scheme}` is not supported by this build; enable its Cargo feature"
+    )]
+    UnsupportedDriver { scheme: String },
+
+    /// The database has no equivalent for this operation. `operation` names it and `driver`
+    /// names the database. See `docs/laravel-differences.md` for each case.
+    #[error("{operation} is not supported on {driver}")]
+    Unsupported {
+        operation: &'static str,
+        driver: &'static str,
+    },
 
     /// A column is not in the model's `FILLABLE` list.
     #[error("column `{column}` is not fillable on table `{table}`")]
@@ -91,38 +118,73 @@ pub enum Error {
 }
 
 impl From<sqlx::Error> for Error {
-    /// Classifies the driver error by its kind and MySQL error number. Anything else is kept as
-    /// `Database`.
+    /// Classifies the driver error by its kind, then by the driver's error code where the kind
+    /// does not say enough. Anything else is kept as `Database`.
     fn from(error: sqlx::Error) -> Self {
         if let sqlx::Error::Database(db) = &error {
             match db.kind() {
                 ErrorKind::UniqueViolation => {
                     return Self::UniqueViolation {
-                        index: duplicate_key(db.message()),
+                        index: violated_name(db.as_ref(), true),
                     };
                 }
                 ErrorKind::ForeignKeyViolation => {
                     return Self::ForeignKeyViolation {
-                        constraint: foreign_key(db.message()),
+                        constraint: violated_name(db.as_ref(), false),
                     };
                 }
                 _ => {}
             }
-            // The driver maps lock errors to `Other`, so they are matched by number.
-            if let Some(mysql) = db.try_downcast_ref::<MySqlDatabaseError>() {
-                match mysql.number() {
-                    ER_LOCK_DEADLOCK => return Self::Deadlock,
-                    ER_LOCK_WAIT_TIMEOUT => return Self::LockWaitTimeout,
-                    _ => {}
-                }
+            if let Some(kind) = lock_error(db.as_ref()) {
+                return kind;
             }
         }
         Self::Database(error)
     }
 }
 
+/// The name of the violated index (`unique`) or foreign key. MySQL reports it only in the message,
+/// so that is read. The other drivers return it as the constraint name; SQLite returns none.
+#[cfg_attr(not(feature = "mysql"), allow(unused_variables))]
+fn violated_name(db: &dyn sqlx::error::DatabaseError, unique: bool) -> Option<String> {
+    #[cfg(feature = "mysql")]
+    if db.try_downcast_ref::<MySqlDatabaseError>().is_some() {
+        return if unique {
+            duplicate_key(db.message())
+        } else {
+            foreign_key(db.message())
+        };
+    }
+    db.constraint().map(str::to_owned)
+}
+
+/// The deadlock or lock-timeout error for the driver's code, if this is one.
+#[cfg_attr(
+    not(any(feature = "mysql", feature = "postgres")),
+    allow(unused_variables)
+)]
+fn lock_error(db: &dyn sqlx::error::DatabaseError) -> Option<Error> {
+    #[cfg(feature = "mysql")]
+    if let Some(mysql) = db.try_downcast_ref::<MySqlDatabaseError>() {
+        match mysql.number() {
+            ER_LOCK_DEADLOCK => return Some(Error::Deadlock),
+            ER_LOCK_WAIT_TIMEOUT => return Some(Error::LockWaitTimeout),
+            _ => {}
+        }
+    }
+    // The driver maps lock errors to `Other`, so they are matched by their code.
+    #[cfg(feature = "postgres")]
+    match db.code().as_deref() {
+        Some(PG_DEADLOCK_DETECTED) => return Some(Error::Deadlock),
+        Some(PG_LOCK_NOT_AVAILABLE) => return Some(Error::LockWaitTimeout),
+        _ => {}
+    }
+    None
+}
+
 /// The index in a "Duplicate entry 'value' for key 'index'" message. MySQL 8.0.19 and later
 /// prefix the table name, as in `table.index`, which is removed here.
+#[cfg(feature = "mysql")]
 fn duplicate_key(message: &str) -> Option<String> {
     const MARK: &str = "for key '";
     let start = message.rfind(MARK)? + MARK.len();
@@ -131,6 +193,7 @@ fn duplicate_key(message: &str) -> Option<String> {
 }
 
 /// The constraint in a "... CONSTRAINT `name` FOREIGN KEY ..." message.
+#[cfg(feature = "mysql")]
 fn foreign_key(message: &str) -> Option<String> {
     const MARK: &str = "CONSTRAINT `";
     let start = message.find(MARK)? + MARK.len();
@@ -138,7 +201,7 @@ fn foreign_key(message: &str) -> Option<String> {
     Some(rest[..rest.find('`')?].to_owned())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mysql"))]
 mod tests {
     use super::{duplicate_key, foreign_key};
 

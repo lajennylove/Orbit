@@ -1,10 +1,11 @@
-use sqlx::FromRow;
-use sqlx::mysql::MySqlRow;
-
 use crate::Query;
+use crate::driver::rows::DriverRows;
 
 /// A table and the Rust type that its rows map to. Derive it with `#[derive(OrbitModel)]`, or write it by hand.
-pub trait Model: for<'r> FromRow<'r, MySqlRow> + Send + Unpin + Sized {
+///
+/// A model decodes from the row type of every database that the build enables, so `DriverRows`
+/// holds for it. With only one database enabled, that is the one `FromRow` for that database.
+pub trait Model: DriverRows + Send + Unpin + Sized {
     /// The table name.
     const TABLE: &'static str;
 

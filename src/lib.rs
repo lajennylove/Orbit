@@ -1,12 +1,14 @@
-//! Orbit is an ORM for Rocket.rs apps. The first database is MySQL and MariaDB; PostgreSQL
-//! and SQLite follow once the MySQL path passes the same tests.
+//! Orbit is an ORM for Rocket.rs apps. It supports MySQL and MariaDB, PostgreSQL and SQLite,
+//! each behind a Cargo feature of the same name. The database is chosen by the URL.
 //!
 //! Orbit uses `sqlx` for the connection pool and the wire protocol, and adds the ORM layer
 //! on top of it.
 
+mod backend;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 mod database;
+mod driver;
 mod error;
 mod migrate;
 mod model;
@@ -20,6 +22,9 @@ mod value;
 pub use sqlx as __sqlx;
 
 pub use database::{Database, PoolOptions};
+pub use driver::Driver;
+#[doc(hidden)]
+pub use driver::rows::DriverRows;
 pub use error::Error;
 pub use migrate::{Migration, Migrator, State, Status};
 pub use model::Model;

@@ -1,10 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
-use sqlx::Arguments;
-use sqlx::mysql::MySqlArguments;
 
-use crate::Error;
-
-/// A value bound to a query. Orbit sends every value as a bind parameter, never as SQL text.
+/// A value bound to a query. Orbit sends every value as a bind parameter, never as SQL text,
+/// except that PostgreSQL gets a `NULL` written into the SQL, since its parameters need a type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -91,24 +88,4 @@ impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(value: Option<T>) -> Self {
         value.map_or(Self::Null, Into::into)
     }
-}
-
-/// Binds `values` in order, for the `?` placeholders of a statement.
-pub(crate) fn bind(values: Vec<Value>) -> Result<MySqlArguments, Error> {
-    let mut args = MySqlArguments::default();
-    for value in values {
-        let added = match value {
-            Value::Null => args.add(None::<i64>),
-            Value::Bool(v) => args.add(v),
-            Value::Int(v) => args.add(v),
-            Value::UInt(v) => args.add(v),
-            Value::Float(v) => args.add(v),
-            Value::Text(v) => args.add(v),
-            Value::DateTime(v) => args.add(v),
-            Value::Date(v) => args.add(v),
-            Value::Bytes(v) => args.add(v),
-        };
-        added.map_err(|e| Error::Database(sqlx::Error::Encode(e)))?;
-    }
-    Ok(args)
 }

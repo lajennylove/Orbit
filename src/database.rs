@@ -1,9 +1,21 @@
 use std::time::Duration;
 
+use sqlx::Database as SqlxDatabase;
+#[cfg(feature = "mysql")]
+use sqlx::MySql;
+#[cfg(feature = "mysql")]
 use sqlx::MySqlPool;
-use sqlx::mysql::MySqlPoolOptions;
+#[cfg(feature = "postgres")]
+use sqlx::PgPool;
+#[cfg(feature = "postgres")]
+use sqlx::Postgres;
+#[cfg(feature = "sqlite")]
+use sqlx::Sqlite;
+#[cfg(feature = "sqlite")]
+use sqlx::SqlitePool;
 
-use crate::{Error, Transaction};
+use crate::transaction::Target;
+use crate::{Driver, Error, Transaction};
 
 /// The settings for the connection pool, given to `Database::connect_with`. `Default` gives the
 /// settings that `Database::connect` uses.
@@ -27,14 +39,63 @@ impl Default for PoolOptions {
     }
 }
 
+/// The pool of the database that the URL named. One variant per enabled driver.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum Pool {
+    #[cfg(feature = "mysql")]
+    MySql(MySqlPool),
+    #[cfg(feature = "postgres")]
+    Postgres(PgPool),
+    #[cfg(feature = "sqlite")]
+    Sqlite(SqlitePool),
+}
+
+impl Pool {
+    pub(crate) fn driver(&self) -> Driver {
+        match self {
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => Driver::MySql,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => Driver::Postgres,
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => Driver::Sqlite,
+        }
+    }
+}
+
 /// The connection pool for one database. Clone-free: share it behind an `Arc` or in Rocket's state.
+///
+/// The driver comes from the URL's scheme: `mysql://` (or `mariadb://`), `postgres://` (or
+/// `postgresql://`) and `sqlite:`. A scheme whose feature is not enabled is an error.
 #[derive(Debug)]
 pub struct Database {
-    pool: MySqlPool,
+    pub(crate) pool: Pool,
+}
+
+/// The driver that a URL's scheme names, if its feature is enabled.
+fn driver_for(url: &str) -> Result<Driver, Error> {
+    let scheme = url.split_once(':').map_or(url, |(scheme, _)| scheme);
+    #[cfg(feature = "mysql")]
+    if <MySql as SqlxDatabase>::URL_SCHEMES.contains(&scheme) {
+        return Ok(Driver::MySql);
+    }
+    #[cfg(feature = "postgres")]
+    if <Postgres as SqlxDatabase>::URL_SCHEMES.contains(&scheme) {
+        return Ok(Driver::Postgres);
+    }
+    #[cfg(feature = "sqlite")]
+    if <Sqlite as SqlxDatabase>::URL_SCHEMES.contains(&scheme) {
+        return Ok(Driver::Sqlite);
+    }
+    Err(Error::UnsupportedDriver {
+        scheme: scheme.to_owned(),
+    })
 }
 
 impl Database {
-    /// Connects to the database at `url`, such as `mysql://user:password@host/database`.
+    /// Connects to the database at `url`, such as `mysql://user:password@host/database`,
+    /// `postgres://user:password@host/database` or `sqlite:path/to/file.db`.
     pub async fn connect(url: &str) -> Result<Self, Error> {
         Self::connect_with(url, PoolOptions::default()).await
     }
@@ -42,23 +103,63 @@ impl Database {
     /// Connects to the database at `url` with the pool settings in `options`. `connect` uses
     /// `PoolOptions::default()`.
     pub async fn connect_with(url: &str, options: PoolOptions) -> Result<Self, Error> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(options.max_connections)
-            .min_connections(options.min_connections)
-            .acquire_timeout(options.acquire_timeout)
-            .connect(url)
-            .await?;
+        let pool = match driver_for(url)? {
+            #[cfg(feature = "mysql")]
+            Driver::MySql => Pool::MySql(options.apply::<MySql>().connect(url).await?),
+            #[cfg(feature = "postgres")]
+            Driver::Postgres => Pool::Postgres(options.apply::<Postgres>().connect(url).await?),
+            #[cfg(feature = "sqlite")]
+            Driver::Sqlite => Pool::Sqlite(options.apply::<Sqlite>().connect(url).await?),
+        };
         Ok(Self { pool })
     }
 
-    /// The underlying pool, for queries that Orbit does not wrap yet.
+    /// The database this pool talks to.
+    pub fn driver(&self) -> Driver {
+        self.pool.driver()
+    }
+
+    /// The MySQL pool, for queries that Orbit does not wrap yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the database is not MySQL. Check `driver()` first, or use `postgres_pool` or
+    /// `sqlite_pool`.
+    #[cfg(feature = "mysql")]
     pub fn pool(&self) -> &MySqlPool {
-        &self.pool
+        match &self.pool {
+            Pool::MySql(pool) => pool,
+            #[cfg(any(feature = "postgres", feature = "sqlite"))]
+            _ => panic!(
+                "`pool` is for MySQL; this database is {}",
+                self.driver().name()
+            ),
+        }
+    }
+
+    /// The PostgreSQL pool, for queries that Orbit does not wrap yet. `None` for other databases.
+    #[cfg(feature = "postgres")]
+    pub fn postgres_pool(&self) -> Option<&PgPool> {
+        match &self.pool {
+            Pool::Postgres(pool) => Some(pool),
+            #[cfg(any(feature = "mysql", feature = "sqlite"))]
+            _ => None,
+        }
+    }
+
+    /// The SQLite pool, for queries that Orbit does not wrap yet. `None` for other databases.
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_pool(&self) -> Option<&SqlitePool> {
+        match &self.pool {
+            Pool::Sqlite(pool) => Some(pool),
+            #[cfg(any(feature = "mysql", feature = "postgres"))]
+            _ => None,
+        }
     }
 
     /// Checks that the database answers.
     pub async fn ping(&self) -> Result<(), Error> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        crate::backend::execute(Target::Pool(&self.pool), "SELECT 1", &[]).await?;
         Ok(())
     }
 
@@ -89,6 +190,23 @@ impl Database {
 
     /// Closes every connection in the pool.
     pub async fn close(&self) {
-        self.pool.close().await;
+        match &self.pool {
+            #[cfg(feature = "mysql")]
+            Pool::MySql(pool) => pool.close().await,
+            #[cfg(feature = "postgres")]
+            Pool::Postgres(pool) => pool.close().await,
+            #[cfg(feature = "sqlite")]
+            Pool::Sqlite(pool) => pool.close().await,
+        }
+    }
+}
+
+impl PoolOptions {
+    /// The sqlx pool options with these settings, for driver `DB`.
+    fn apply<DB: SqlxDatabase>(self) -> sqlx::pool::PoolOptions<DB> {
+        sqlx::pool::PoolOptions::<DB>::new()
+            .max_connections(self.max_connections)
+            .min_connections(self.min_connections)
+            .acquire_timeout(self.acquire_timeout)
     }
 }
