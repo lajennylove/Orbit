@@ -414,10 +414,11 @@ async fn a_run_waits_for_another_process_then_gives_up() {
     };
     // Another process holds the migrations lock on its own connection.
     let mut other = db.pool().acquire().await.expect("a connection");
-    let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK('orbit_migrations', 0)")
-        .fetch_one(&mut *other)
-        .await
-        .expect("takes the lock");
+    let got: Option<i64> =
+        sqlx::query_scalar("SELECT GET_LOCK(CONCAT('orbit_migrations:', DATABASE()), 0)")
+            .fetch_one(&mut *other)
+            .await
+            .expect("takes the lock");
     assert_eq!(got, Some(1));
 
     let migrator = Migrator::from_dir(fixture("basic"))
@@ -426,7 +427,7 @@ async fn a_run_waits_for_another_process_then_gives_up() {
     let err = migrator.run(&db).await.expect_err("the lock is held");
     assert!(matches!(err, Error::MigrationsLocked { seconds: 1 }));
 
-    sqlx::query("SELECT RELEASE_LOCK('orbit_migrations')")
+    sqlx::query("SELECT RELEASE_LOCK(CONCAT('orbit_migrations:', DATABASE()))")
         .execute(&mut *other)
         .await
         .expect("releases the lock");

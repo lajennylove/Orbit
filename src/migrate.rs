@@ -55,8 +55,9 @@ pub struct Migrator {
     lock_timeout: Duration,
 }
 
-/// The name of the MySQL lock that serialises `run` and `rollback` across processes.
-const LOCK_NAME: &str = "orbit_migrations";
+/// The MySQL lock that serialises `run` and `rollback` across processes is named after the
+/// database, so two databases on one server do not wait for each other.
+const LOCK_PREFIX: &str = "orbit_migrations";
 
 /// How long `run` and `rollback` wait for another process's lock before giving up.
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -329,7 +330,7 @@ impl Migrator {
     ) -> Result<T, Error> {
         let mut conn = db.pool().acquire().await?;
         let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
-            .bind(LOCK_NAME)
+            .bind(lock_name(db))
             .bind(self.lock_timeout.as_secs() as i64)
             .fetch_one(&mut *conn)
             .await?;
@@ -341,7 +342,7 @@ impl Migrator {
 
         let result = body.await;
         let released = sqlx::query("SELECT RELEASE_LOCK(?)")
-            .bind(LOCK_NAME)
+            .bind(lock_name(db))
             .execute(&mut *conn)
             .await;
         if released.is_err() {
@@ -453,4 +454,12 @@ pub(crate) fn read_file(path: &Path) -> Result<String, Error> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// The lock name for `db`: the prefix and the database name.
+fn lock_name(db: &Database) -> String {
+    format!(
+        "{LOCK_PREFIX}:{}",
+        db.pool().connect_options().get_database().unwrap_or("")
+    )
 }
