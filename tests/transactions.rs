@@ -8,10 +8,19 @@ use std::sync::Arc;
 
 use orbit_orm::{Database, Error, Model, raw};
 use sqlx::{FromRow, Row};
+use tokio::sync::{Mutex, MutexGuard};
 
-async fn connect() -> Option<Database> {
+/// The tests share one database, so they run one at a time, on every driver, as the migration and
+/// history tests do. On SQLite, a transaction that holds a read lock can wait on a writer in
+/// another test while that writer waits for the read lock to clear. Both then fail after the busy
+/// timeout, which made the transaction tests fail now and then when they ran in parallel.
+static LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Connects and takes the lock. The lock is held until the test ends.
+async fn connect() -> Option<(MutexGuard<'static, ()>, Database)> {
     let url = common::url()?;
-    Some(Database::connect(&url).await.expect("connects"))
+    let guard = LOCK.lock().await;
+    Some((guard, Database::connect(&url).await.expect("connects")))
 }
 
 /// Declares a row type and its model on the given table.
@@ -73,7 +82,9 @@ async fn teardown(db: &Database, table: &str) {
 
 #[tokio::test]
 async fn commits_when_the_closure_returns_ok() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Commit::TABLE).await;
 
     let id = db
@@ -95,7 +106,9 @@ async fn commits_when_the_closure_returns_ok() {
 
 #[tokio::test]
 async fn rolls_back_when_the_closure_returns_err() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Rollback::TABLE).await;
 
     let result = db
@@ -118,7 +131,9 @@ async fn rolls_back_when_the_closure_returns_err() {
 
 #[tokio::test]
 async fn a_panic_rolls_back_and_does_not_commit() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Panicking::TABLE).await;
     let db = Arc::new(db);
 
@@ -146,7 +161,9 @@ async fn a_panic_rolls_back_and_does_not_commit() {
 
 #[tokio::test]
 async fn queries_in_the_transaction_see_their_own_writes() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Own::TABLE).await;
     let outside = &db;
 
@@ -173,7 +190,9 @@ async fn queries_in_the_transaction_see_their_own_writes() {
 
 #[tokio::test]
 async fn for_update_locks_the_row_for_other_transactions() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Locked::TABLE).await;
     common::exec(
         &db,
@@ -266,7 +285,9 @@ async fn for_update_locks_the_row_for_other_transactions() {
 
 #[tokio::test]
 async fn for_update_outside_a_transaction_runs_in_autocommit() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, LockOutside::TABLE).await;
     common::exec(
         &db,
@@ -319,7 +340,9 @@ async fn for_update_outside_a_transaction_runs_in_autocommit() {
 
 #[tokio::test]
 async fn the_transaction_connection_runs_raw_sql() {
-    let Some(db) = connect().await else { return };
+    let Some((_lock, db)) = connect().await else {
+        return;
+    };
     setup(&db, Raw::TABLE).await;
     let db_driver = db.driver();
 
