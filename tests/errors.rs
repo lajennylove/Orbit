@@ -1,16 +1,14 @@
-//! Runs against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test database,
-//! such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are skipped with a
-//! notice when it is not set. Each test uses its own tables and drops them at the end.
+//! Runs against a real database: MySQL or MariaDB, PostgreSQL or SQLite. Set `ORBIT_DATABASE_URL`
+//! to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`. The tests are skipped
+//! with a notice when it is not set. Each test uses its own tables and drops them at the end.
+
+mod common;
 
 use orbit_orm::{Database, Error, Model, Value};
-use sqlx::mysql::MySqlRow;
-use sqlx::{AssertSqlSafe, FromRow, Row};
+use sqlx::{FromRow, Row};
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
 }
 
@@ -23,8 +21,13 @@ macro_rules! model {
             id: i64,
         }
 
-        impl<'r> FromRow<'r, MySqlRow> for $name {
-            fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+        impl<'r, R> FromRow<'r, R> for $name
+        where
+            R: Row,
+            &'r str: sqlx::ColumnIndex<R>,
+            i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+        {
+            fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
                 Ok(Self {
                     id: row.try_get("id")?,
                 })
@@ -43,29 +46,16 @@ model!(Parent, "orbit_err_parent", "name");
 model!(Child, "orbit_err_child", "parent_id");
 model!(Missing, "orbit_err_missing", "name");
 
-async fn run(db: &Database, sql: &str) {
-    sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
-        .execute(db.pool())
-        .await
-        .expect("runs the setup SQL");
-}
-
-/// Drops the tables, so a test starts clean. Tests run in parallel, so each one drops only its
-/// own tables.
-async fn drop_tables(db: &Database, tables: &str) {
-    run(db, &format!("DROP TABLE IF EXISTS {tables}")).await;
-}
-
 #[tokio::test]
 async fn a_duplicate_key_is_a_unique_violation_with_the_index_name() {
     let Some(db) = connect().await else { return };
-    drop_tables(&db, "orbit_err_users").await;
-    run(
+    common::drop_tables(&db, &["orbit_err_users"]).await;
+    common::exec(
         &db,
         "CREATE TABLE orbit_err_users (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
             email VARCHAR(255) NOT NULL,
-            UNIQUE KEY orbit_err_email_unique (email)
+            UNIQUE KEY `orbit_err_email_unique` (email)
         )",
     )
     .await;
@@ -80,20 +70,25 @@ async fn a_duplicate_key_is_a_unique_violation_with_the_index_name() {
         .expect_err("the second insert breaks the index");
     match err {
         Error::UniqueViolation { index } => {
-            assert_eq!(index.as_deref(), Some("orbit_err_email_unique"));
+            if common::on_sqlite(db.driver()) {
+                // SQLite does not say which index a violation came from.
+                assert_eq!(index, None);
+            } else {
+                assert_eq!(index.as_deref(), Some("orbit_err_email_unique"));
+            }
         }
         other => panic!("expected a unique violation, got {other:?}"),
     }
 
-    drop_tables(&db, "orbit_err_users").await;
+    common::drop_tables(&db, &["orbit_err_users"]).await;
     db.close().await;
 }
 
 #[tokio::test]
 async fn a_missing_parent_is_a_foreign_key_violation() {
     let Some(db) = connect().await else { return };
-    drop_tables(&db, "orbit_err_child, orbit_err_parent").await;
-    run(
+    common::drop_tables(&db, &["orbit_err_child", "orbit_err_parent"]).await;
+    common::exec(
         &db,
         "CREATE TABLE orbit_err_parent (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL);
          CREATE TABLE orbit_err_child (
@@ -110,7 +105,12 @@ async fn a_missing_parent_is_a_foreign_key_violation() {
         .expect_err("no parent has id 99");
     match err {
         Error::ForeignKeyViolation { constraint } => {
-            assert_eq!(constraint.as_deref(), Some("orbit_err_child_parent_fk"));
+            if common::on_sqlite(db.driver()) {
+                // SQLite does not say which constraint a violation came from.
+                assert_eq!(constraint, None);
+            } else {
+                assert_eq!(constraint.as_deref(), Some("orbit_err_child_parent_fk"));
+            }
         }
         other => panic!("expected a foreign key violation, got {other:?}"),
     }
@@ -131,7 +131,7 @@ async fn a_missing_parent_is_a_foreign_key_violation() {
         .expect_err("the child still refers to the parent");
     assert!(matches!(delete, Error::ForeignKeyViolation { .. }));
 
-    drop_tables(&db, "orbit_err_child, orbit_err_parent").await;
+    common::drop_tables(&db, &["orbit_err_child", "orbit_err_parent"]).await;
     db.close().await;
 }
 

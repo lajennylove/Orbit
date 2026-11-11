@@ -1,15 +1,14 @@
-//! Runs the `OrbitModel` derive against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL`
-//! to a test database, such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are
-//! skipped with a notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs the `OrbitModel` derive against a real database: MySQL or MariaDB, PostgreSQL or SQLite.
+//! Set `ORBIT_DATABASE_URL` to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`.
+//! The tests are skipped with a notice when it is not set. Each test uses its own table and drops
+//! it at the end.
+
+mod common;
 
 use orbit_orm::{Database, Direction, Error, Model, OrbitModel, Query, Value};
-use sqlx::AssertSqlSafe;
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
 }
 
@@ -35,10 +34,7 @@ struct Tag {
 }
 
 async fn run_sql(db: &Database, sql: &str) {
-    sqlx::query(AssertSqlSafe(sql.to_owned()))
-        .execute(db.pool())
-        .await
-        .expect("runs sql");
+    common::exec(db, sql).await;
 }
 
 async fn setup_posts(db: &Database) {

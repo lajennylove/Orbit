@@ -1,18 +1,16 @@
-//! Runs against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test database,
-//! such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are skipped with a
-//! notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs against a real database: MySQL or MariaDB, PostgreSQL or SQLite. Set `ORBIT_DATABASE_URL`
+//! to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`. The tests are skipped
+//! with a notice when it is not set. Each test uses its own table and drops it at the end.
+
+mod common;
 
 use std::sync::Arc;
 
-use orbit_orm::{Database, Error, Model};
-use sqlx::mysql::MySqlRow;
-use sqlx::{AssertSqlSafe, FromRow, Row};
+use orbit_orm::{Database, Error, Model, raw};
+use sqlx::{FromRow, Row};
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
 }
 
@@ -25,8 +23,14 @@ macro_rules! item {
             title: String,
         }
 
-        impl<'r> FromRow<'r, MySqlRow> for $name {
-            fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+        impl<'r, R> FromRow<'r, R> for $name
+        where
+            R: Row,
+            &'r str: sqlx::ColumnIndex<R>,
+            i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+            String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+        {
+            fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
                 Ok(Self {
                     id: row.try_get("id")?,
                     title: row.try_get("title")?,
@@ -50,26 +54,21 @@ item!(Locked, "orbit_tx_lock");
 item!(LockOutside, "orbit_tx_lock_outside");
 
 async fn setup(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS `{table}`")))
-        .execute(db.pool())
-        .await
-        .expect("drops a leftover table");
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE `{table}` (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            title VARCHAR(255) NOT NULL
-        )"
-    )))
-    .execute(db.pool())
-    .await
-    .expect("creates the table");
+    common::drop_tables(db, &[table]).await;
+    common::exec(
+        db,
+        &format!(
+            "CREATE TABLE `{table}` (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                title VARCHAR(255) NOT NULL
+            )"
+        ),
+    )
+    .await;
 }
 
 async fn teardown(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS `{table}`")))
-        .execute(db.pool())
-        .await
-        .expect("drops the table");
+    common::drop_tables(db, &[table]).await;
 }
 
 #[tokio::test]
@@ -176,14 +175,16 @@ async fn queries_in_the_transaction_see_their_own_writes() {
 async fn for_update_locks_the_row_for_other_transactions() {
     let Some(db) = connect().await else { return };
     setup(&db, Locked::TABLE).await;
-    sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO `{}` (id, title) VALUES (1, 'a')",
-        Locked::TABLE
-    )))
-    .execute(db.pool())
-    .await
-    .expect("seeds a row");
+    common::exec(
+        &db,
+        &format!(
+            "INSERT INTO `{}` (id, title) VALUES (1, 'a')",
+            Locked::TABLE
+        ),
+    )
+    .await;
     let outside = &db;
+    let driver = db.driver();
 
     let outer = db
         .transaction(async |tx| {
@@ -193,30 +194,63 @@ async fn for_update_locks_the_row_for_other_transactions() {
                 .first_or_fail(&mut *tx)
                 .await?;
             assert_eq!(row.title, "a");
-            assert!(
-                Locked::query()
-                    .where_eq("id", 1)
-                    .for_update()
-                    .exists(&mut *tx)
-                    .await?
-            );
-            assert_eq!(Locked::query().for_update().count(&mut *tx).await?, 1);
+            // PostgreSQL refuses FOR UPDATE with an aggregate such as COUNT or EXISTS, so those
+            // checks run only where the database accepts them. SQLite has no row locks, so the
+            // clause is left out and the checks are plain reads.
+            if !common::on_postgres(driver) {
+                assert!(
+                    Locked::query()
+                        .where_eq("id", 1)
+                        .for_update()
+                        .exists(&mut *tx)
+                        .await?
+                );
+                assert_eq!(Locked::query().for_update().count(&mut *tx).await?, 1);
+            }
 
-            // A second transaction on another connection waits for the lock, then gives up.
+            if common::on_sqlite(driver) {
+                // SQLite has no row locks: FOR UPDATE is a no-op, so a second transaction reads
+                // the row at once instead of waiting for the lock.
+                let read = outside
+                    .transaction(async |inner| {
+                        Locked::query()
+                            .where_eq("id", 1)
+                            .for_update()
+                            .first_or_fail(&mut *inner)
+                            .await
+                    })
+                    .await
+                    .expect("SQLite reads without a row lock");
+                assert_eq!(read.title, "a");
+                return Ok::<(), Error>(());
+            }
+
+            // A second transaction on another connection waits for the lock, then gives up. The
+            // wait is bounded by the database's lock timeout, set for this transaction only.
             let blocked = outside
                 .transaction(async |inner| {
-                    sqlx::query("SET SESSION innodb_lock_wait_timeout = 1")
-                        .execute(inner.connection())
-                        .await?;
+                    if common::on_mysql(driver) {
+                        raw::execute(&mut *inner, "SET SESSION innodb_lock_wait_timeout = 1", &[])
+                            .await?;
+                    } else {
+                        raw::execute(&mut *inner, "SET LOCAL lock_timeout = '1s'", &[]).await?;
+                    }
                     let attempt = Locked::query()
                         .where_eq("id", 1)
                         .for_update()
                         .first(&mut *inner)
                         .await
                         .map(|_| ());
-                    sqlx::query("SET SESSION innodb_lock_wait_timeout = DEFAULT")
-                        .execute(inner.connection())
+                    // On PostgreSQL a failed statement aborts the transaction, so the reset
+                    // runs only on MySQL, where it is still allowed.
+                    if common::on_mysql(driver) {
+                        raw::execute(
+                            &mut *inner,
+                            "SET SESSION innodb_lock_wait_timeout = DEFAULT",
+                            &[],
+                        )
                         .await?;
+                    }
                     attempt
                 })
                 .await;
@@ -234,13 +268,14 @@ async fn for_update_locks_the_row_for_other_transactions() {
 async fn for_update_outside_a_transaction_runs_in_autocommit() {
     let Some(db) = connect().await else { return };
     setup(&db, LockOutside::TABLE).await;
-    sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO `{}` (id, title) VALUES (1, 'a')",
-        LockOutside::TABLE
-    )))
-    .execute(db.pool())
-    .await
-    .expect("seeds a row");
+    common::exec(
+        &db,
+        &format!(
+            "INSERT INTO `{}` (id, title) VALUES (1, 'a')",
+            LockOutside::TABLE
+        ),
+    )
+    .await;
 
     // On the pool, FOR UPDATE runs in autocommit and succeeds, as Laravel's lockForUpdate does.
     let fetched = LockOutside::query()
@@ -258,22 +293,25 @@ async fn for_update_outside_a_transaction_runs_in_autocommit() {
         .expect("the locked read succeeds");
     assert_eq!(all.len(), 1);
 
-    assert_eq!(
-        LockOutside::query()
-            .for_update()
-            .count(&db)
-            .await
-            .expect("the locked count succeeds"),
-        1
-    );
-    assert!(
-        LockOutside::query()
-            .where_eq("id", 1)
-            .for_update()
-            .exists(&db)
-            .await
-            .expect("the locked exists succeeds")
-    );
+    // PostgreSQL refuses FOR UPDATE with COUNT and EXISTS, so only the other databases check them.
+    if !common::on_postgres(db.driver()) {
+        assert_eq!(
+            LockOutside::query()
+                .for_update()
+                .count(&db)
+                .await
+                .expect("the locked count succeeds"),
+            1
+        );
+        assert!(
+            LockOutside::query()
+                .where_eq("id", 1)
+                .for_update()
+                .exists(&db)
+                .await
+                .expect("the locked exists succeeds")
+        );
+    }
 
     teardown(&db, LockOutside::TABLE).await;
     db.close().await;
@@ -283,14 +321,15 @@ async fn for_update_outside_a_transaction_runs_in_autocommit() {
 async fn the_transaction_connection_runs_raw_sql() {
     let Some(db) = connect().await else { return };
     setup(&db, Raw::TABLE).await;
+    let db_driver = db.driver();
 
     let counted: i64 = db
         .transaction(async |tx| {
-            let n: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT COUNT(*) FROM `{}`",
-                Raw::TABLE
-            )))
-            .fetch_one(tx.connection())
+            let n: i64 = raw::fetch_scalar(
+                &mut *tx,
+                &common::sql(db_driver, &format!("SELECT COUNT(*) FROM `{}`", Raw::TABLE)),
+                &[],
+            )
             .await?;
             Ok::<_, Error>(n)
         })

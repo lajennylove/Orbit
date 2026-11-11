@@ -1,19 +1,18 @@
-//! Runs the blocking API against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a
-//! test database, such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are
-//! skipped with a notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs the blocking API against a real database: MySQL or MariaDB, PostgreSQL or SQLite. Set
+//! `ORBIT_DATABASE_URL` to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`. The
+//! tests are skipped with a notice when it is not set. Each test uses its own table and drops it
+//! at the end.
+
+mod common;
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 use orbit_orm::blocking::Database;
 use orbit_orm::{Error, Model, OrbitModel};
-use sqlx::AssertSqlSafe;
 
 fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).expect("connects"))
 }
 
@@ -83,11 +82,18 @@ struct Code {
     title: String,
 }
 
-/// Runs a statement on the pool, through `run`, since sqlx is async.
+/// Runs a statement through an async connection to the same database. The blocking handle does
+/// not expose its async pool, so the setup opens its own for each statement.
 fn run_sql(db: &Database, sql: &str) {
-    db.run(sqlx::query(AssertSqlSafe(sql.to_owned())).execute(db.pool()))
-        .expect("runs on the blocking database")
-        .expect("runs sql");
+    let url = common::url().expect("ORBIT_DATABASE_URL is set");
+    db.run(async {
+        let admin = orbit_orm::Database::connect(&url)
+            .await
+            .expect("connects for setup");
+        common::exec(&admin, sql).await;
+        admin.close().await;
+    })
+    .expect("runs on the blocking database");
 }
 
 /// Recreates `table` with an id and a title, as the models above expect.
@@ -120,6 +126,10 @@ fn a_wrong_password_is_an_error() {
     let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
         return;
     };
+    // SQLite has no users or passwords, so there is no login to get wrong.
+    if url.starts_with("sqlite:") {
+        return;
+    }
     let wrong = url.replacen("://", "://orbit-no-such-user:wrong@", 1);
     assert!(Database::connect(&wrong).is_err());
 }
@@ -211,7 +221,7 @@ fn replace_overwrites_on_a_unique_key() {
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
             code VARCHAR(32) NOT NULL,
             title VARCHAR(255) NOT NULL,
-            UNIQUE KEY orbit_blocking_codes_code (code)
+            UNIQUE KEY `orbit_blocking_codes_code` (code)
         )",
     );
 
@@ -219,11 +229,32 @@ fn replace_overwrites_on_a_unique_key() {
         .blocking()
         .insert(&db, &[("code", "a".into()), ("title", "first".into())])
         .expect("inserts");
-    let affected = Code::query()
+    let result = Code::query()
         .blocking()
-        .replace(&db, &[("code", "a".into()), ("title", "second".into())])
-        .expect("replaces");
-    assert_eq!(affected, 2);
+        .replace(&db, &[("code", "a".into()), ("title", "second".into())]);
+    if common::on_postgres(db.driver()) {
+        // PostgreSQL has no REPLACE, so replace is refused there.
+        assert!(
+            matches!(
+                result,
+                Err(Error::Unsupported {
+                    operation: "replace",
+                    driver: "PostgreSQL"
+                })
+            ),
+            "got {result:?}"
+        );
+        run_sql(&db, "DROP TABLE IF EXISTS orbit_blocking_codes");
+        db.close().expect("closes");
+        return;
+    }
+    let affected = result.expect("replaces");
+    // MySQL deletes and inserts, so two rows are affected; SQLite reports one.
+    if common::on_mysql(db.driver()) {
+        assert_eq!(affected, 2);
+    } else {
+        assert_eq!(affected, 1);
+    }
 
     let row = Code::query()
         .where_eq("code", "a")

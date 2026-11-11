@@ -1,16 +1,14 @@
-//! Runs against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test database,
-//! such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are skipped with a
-//! notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs against a real database: MySQL or MariaDB, PostgreSQL or SQLite. Set `ORBIT_DATABASE_URL`
+//! to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`. The tests are skipped
+//! with a notice when it is not set. Each test uses its own table and drops it at the end.
+
+mod common;
 
 use orbit_orm::{Database, Error, Value, raw};
-use sqlx::mysql::MySqlRow;
-use sqlx::{AssertSqlSafe, FromRow, Row};
+use sqlx::{FromRow, Row};
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
 }
 
@@ -20,8 +18,14 @@ struct Post {
     title: String,
 }
 
-impl<'r> FromRow<'r, MySqlRow> for Post {
-    fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+impl<'r, R> FromRow<'r, R> for Post
+where
+    R: Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
         Ok(Self {
             id: row.try_get("id")?,
             title: row.try_get("title")?,
@@ -30,27 +34,22 @@ impl<'r> FromRow<'r, MySqlRow> for Post {
 }
 
 async fn setup(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
-        .execute(db.pool())
-        .await
-        .expect("drops a leftover table");
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE {table} (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            title VARCHAR(255) NOT NULL,
-            views BIGINT NOT NULL
-        )"
-    )))
-    .execute(db.pool())
-    .await
-    .expect("creates the table");
+    common::drop_tables(db, &[table]).await;
+    common::exec(
+        db,
+        &format!(
+            "CREATE TABLE {table} (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                views BIGINT NOT NULL
+            )"
+        ),
+    )
+    .await;
 }
 
 async fn teardown(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
-        .execute(db.pool())
-        .await
-        .expect("drops the table");
+    common::drop_tables(db, &[table]).await;
 }
 
 #[tokio::test]
@@ -149,8 +148,17 @@ async fn raw_calls_work_inside_a_transaction() {
                 &["in tx".into(), Value::from(7)],
             )
             .await?;
-            // LAST_INSERT_ID is per connection, so it reads the insert made just above.
-            let id: u64 = raw::fetch_scalar(&mut *tx, "SELECT LAST_INSERT_ID()", &[]).await?;
+            // The last insert id is per connection, so it reads the insert made just above. Each
+            // database names the function its own way; the id is read as a signed integer.
+            let sql = if common::on_mysql(tx.driver()) {
+                "SELECT CAST(LAST_INSERT_ID() AS SIGNED)"
+            } else if common::on_postgres(tx.driver()) {
+                "SELECT lastval()"
+            } else {
+                "SELECT last_insert_rowid()"
+            };
+            let id: i64 = raw::fetch_scalar(&mut *tx, sql, &[]).await?;
+            let id = id as u64;
             let seen: Option<Post> = raw::fetch_optional(
                 &mut *tx,
                 &format!("SELECT id, title FROM {TABLE} WHERE id = ?"),

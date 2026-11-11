@@ -1,17 +1,32 @@
-//! Runs against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test database,
-//! such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are skipped with a
-//! notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs against a real database: MySQL or MariaDB, PostgreSQL or SQLite. Set `ORBIT_DATABASE_URL`
+//! to a test database, such as `mysql://user@127.0.0.1:3306/orbit_test`. The tests are skipped
+//! with a notice when it is not set. Each test uses its own table and drops it at the end.
 
-use orbit_orm::{Database, Direction, Error, Model, Operator, Query, Value};
-use sqlx::mysql::MySqlRow;
-use sqlx::{AssertSqlSafe, FromRow, Row};
+mod common;
+
+use orbit_orm::{Database, Direction, Error, Model, Operator, Query, Value, raw};
+use sqlx::{FromRow, Row};
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
+}
+
+/// A row decoded from the columns every test table has. The id, title and views columns are the
+/// same on every database, so one generic impl serves them all.
+fn decode<'r, R>(row: &'r R) -> Result<(i64, String, Option<i64>), sqlx::Error>
+where
+    R: Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    Ok((
+        row.try_get("id")?,
+        row.try_get("title")?,
+        row.try_get("views")?,
+    ))
 }
 
 /// The primary key of a test row, to compare the rows a query returned.
@@ -29,13 +44,17 @@ macro_rules! model {
             views: Option<i64>,
         }
 
-        impl<'r> FromRow<'r, MySqlRow> for $name {
-            fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
-                Ok(Self {
-                    id: row.try_get("id")?,
-                    title: row.try_get("title")?,
-                    views: row.try_get("views")?,
-                })
+        impl<'r, R> FromRow<'r, R> for $name
+        where
+            R: Row,
+            &'r str: sqlx::ColumnIndex<R>,
+            i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+            String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+            Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+        {
+            fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
+                let (id, title, views) = decode(row)?;
+                Ok(Self { id, title, views })
             }
         }
 
@@ -66,38 +85,50 @@ model!(Inject, "orbit_query_inject");
 model!(BadTable, "orbit`bad");
 
 async fn setup(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS `{table}`")))
-        .execute(db.pool())
-        .await
-        .expect("drops a leftover table");
-    sqlx::query(AssertSqlSafe(format!(
-        "CREATE TABLE `{table}` (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            title VARCHAR(255) NOT NULL,
-            views BIGINT NULL
-        )"
-    )))
-    .execute(db.pool())
-    .await
-    .expect("creates the table");
+    common::drop_tables(db, &[table]).await;
+    common::exec(
+        db,
+        &format!(
+            "CREATE TABLE `{table}` (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                views BIGINT NULL
+            )"
+        ),
+    )
+    .await;
 }
 
 async fn teardown(db: &Database, table: &str) {
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS `{table}`")))
-        .execute(db.pool())
-        .await
-        .expect("drops the table");
+    common::drop_tables(db, &[table]).await;
 }
 
 async fn seed(db: &Database, table: &str, rows: &[(i64, &str, Option<i64>)]) {
+    seed_rows(db, table, rows).await;
+    // PostgreSQL's sequence does not move when ids are given, so the next generated id would
+    // clash with a seeded row. MySQL and SQLite advance their counters on their own.
+    if common::on_postgres(db.driver()) {
+        common::exec(
+            db,
+            &format!(
+                "SELECT setval(pg_get_serial_sequence('{table}', 'id'), \
+                 COALESCE((SELECT MAX(id) FROM `{table}`), 1))"
+            ),
+        )
+        .await;
+    }
+}
+
+async fn seed_rows(db: &Database, table: &str, rows: &[(i64, &str, Option<i64>)]) {
     for (id, title, views) in rows {
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO `{table}` (id, title, views) VALUES (?, ?, ?)"
-        )))
-        .bind(*id)
-        .bind(*title)
-        .bind(*views)
-        .execute(db.pool())
+        raw::execute(
+            db,
+            &common::sql(
+                db.driver(),
+                &format!("INSERT INTO `{table}` (id, title, views) VALUES (?, ?, ?)"),
+            ),
+            &[Value::from(*id), Value::from(*title), Value::from(*views)],
+        )
         .await
         .expect("seeds a row");
     }
@@ -657,8 +688,14 @@ struct TitleOnly {
     title: String,
 }
 
-impl<'r> FromRow<'r, MySqlRow> for TitleOnly {
-    fn from_row(row: &'r MySqlRow) -> Result<Self, sqlx::Error> {
+impl<'r, R> FromRow<'r, R> for TitleOnly
+where
+    R: Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
         Ok(Self {
             id: row.try_get("id")?,
             title: row.try_get("title")?,

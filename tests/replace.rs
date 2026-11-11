@@ -1,16 +1,31 @@
-//! Runs `replace` against a real MySQL or MariaDB server. Set `ORBIT_DATABASE_URL` to a test
-//! database, such as `mysql://user:password@127.0.0.1:3306/orbit_test`. The tests are skipped with
-//! a notice when it is not set. Each test uses its own table and drops it at the end.
+//! Runs `replace` against a real database. Set `ORBIT_DATABASE_URL` to a test database, such as
+//! `mysql://user@127.0.0.1:3306/orbit_test`. The tests are skipped with a notice when it is not
+//! set. Each test uses its own table and drops it at the end.
+//!
+//! `replace` is `REPLACE INTO` on MySQL and SQLite. PostgreSQL has no such statement, so `replace`
+//! is refused there with `Error::Unsupported`, and each test asserts that instead.
+
+mod common;
 
 use orbit_orm::{Database, Error, Model, OrbitModel, Query};
-use sqlx::AssertSqlSafe;
 
 async fn connect() -> Option<Database> {
-    let Ok(url) = std::env::var("ORBIT_DATABASE_URL") else {
-        eprintln!("skipped: set ORBIT_DATABASE_URL to run the database tests");
-        return None;
-    };
+    let url = common::url()?;
     Some(Database::connect(&url).await.expect("connects"))
+}
+
+/// The error PostgreSQL gives for `replace`.
+fn assert_postgres_refuses(result: Result<u64, Error>) {
+    assert!(
+        matches!(
+            result,
+            Err(Error::Unsupported {
+                operation: "replace",
+                driver: "PostgreSQL"
+            })
+        ),
+        "expected Unsupported on PostgreSQL, got {result:?}"
+    );
 }
 
 /// Each test has its own table, since the tests run in parallel.
@@ -36,8 +51,8 @@ item!(Checked, "orbit_replace_fillable");
 
 /// Recreates `table` with a unique `code`, a `title`, and a `note` that defaults to 'none'.
 async fn setup(db: &Database, table: &str) {
-    run_sql(db, &format!("DROP TABLE IF EXISTS `{table}`")).await;
-    run_sql(
+    common::drop_tables(db, &[table]).await;
+    common::exec(
         db,
         &format!(
             "CREATE TABLE `{table}` (
@@ -50,13 +65,6 @@ async fn setup(db: &Database, table: &str) {
         ),
     )
     .await;
-}
-
-async fn run_sql(db: &Database, sql: &str) {
-    sqlx::query(AssertSqlSafe(sql.to_owned()))
-        .execute(db.pool())
-        .await
-        .expect("runs sql");
 }
 
 #[tokio::test]
@@ -76,12 +84,23 @@ async fn replace_overwrites_the_row_on_a_unique_key_and_changes_its_id() {
         .await
         .expect("inserts");
 
-    let affected = Query::<Overwritten>::table()
+    let result = Query::<Overwritten>::table()
         .replace(&db, &[("code", "a".into()), ("title", "second".into())])
-        .await
-        .expect("replaces");
-    // MySQL deletes the old row and inserts the new one, so two rows are affected.
-    assert_eq!(affected, 2);
+        .await;
+    if common::on_postgres(db.driver()) {
+        assert_postgres_refuses(result);
+        common::drop_tables(&db, &[Overwritten::TABLE]).await;
+        db.close().await;
+        return;
+    }
+    let affected = result.expect("replaces");
+    // MySQL deletes the old row and inserts the new one, so two rows are affected. SQLite's
+    // REPLACE does the same delete and insert but reports one row.
+    if common::on_mysql(db.driver()) {
+        assert_eq!(affected, 2);
+    } else {
+        assert_eq!(affected, 1);
+    }
 
     let row = Overwritten::query()
         .where_eq("code", "a")
@@ -97,6 +116,7 @@ async fn replace_overwrites_the_row_on_a_unique_key_and_changes_its_id() {
     );
     assert_eq!(Overwritten::query().count(&db).await.expect("counts"), 1);
 
+    common::drop_tables(&db, &[Overwritten::TABLE]).await;
     db.close().await;
 }
 
@@ -110,10 +130,16 @@ async fn replace_inserts_when_no_row_conflicts() {
         .await
         .expect("inserts");
 
-    let affected = Query::<Inserted>::table()
+    let result = Query::<Inserted>::table()
         .replace(&db, &[("code", "b".into()), ("title", "other".into())])
-        .await
-        .expect("replaces");
+        .await;
+    if common::on_postgres(db.driver()) {
+        assert_postgres_refuses(result);
+        common::drop_tables(&db, &[Inserted::TABLE]).await;
+        db.close().await;
+        return;
+    }
+    let affected = result.expect("replaces");
     assert_eq!(affected, 1, "a plain insert affects one row");
 
     assert_eq!(Inserted::query().count(&db).await.expect("counts"), 2);
@@ -124,6 +150,7 @@ async fn replace_inserts_when_no_row_conflicts() {
         .expect("the other row is untouched");
     assert_eq!(kept.title, "first");
 
+    common::drop_tables(&db, &[Inserted::TABLE]).await;
     db.close().await;
 }
 
@@ -135,7 +162,13 @@ async fn replace_checks_fillable_like_insert() {
     let result = Query::<Checked>::table()
         .replace(&db, &[("id", 5.into())])
         .await;
-    assert!(matches!(result, Err(Error::NotFillable { .. })));
+    if common::on_postgres(db.driver()) {
+        // PostgreSQL refuses replace before it reads the columns, so fillable is not reached.
+        assert_postgres_refuses(result);
+    } else {
+        assert!(matches!(result, Err(Error::NotFillable { .. })));
+    }
 
+    common::drop_tables(&db, &[Checked::TABLE]).await;
     db.close().await;
 }
