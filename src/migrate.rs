@@ -16,18 +16,29 @@ use std::time::Instant;
 
 use crate::backend;
 use crate::database::Pool;
+use crate::schema::Statement;
 use crate::transaction::{Target, Transaction};
 use crate::{Database, Driver, Error, Value};
 
-/// One migration: its name, and the SQL that applies it (`up`) and reverts it (`down`).
+/// One migration: its name, and what applies it (`up`) and reverts it (`down`). Either fixed SQL
+/// ([`Migration::new`], files) or schema statements ([`Migration::schema`]).
 #[derive(Debug, Clone)]
 pub struct Migration {
     /// The folder name, such as `20261108000000_create_users`.
     pub name: String,
-    /// The contents of `up.sql`.
+    /// The contents of `up.sql`. Empty for a [`schema`](Self::schema) migration, which carries
+    /// statements instead.
     pub up: String,
-    /// The contents of `down.sql`.
+    /// The contents of `down.sql`. Empty for a [`schema`](Self::schema) migration.
     pub down: String,
+    /// The statements of a schema migration, rendered when the migrator runs it.
+    schema: Option<SchemaBody>,
+}
+
+#[derive(Debug, Clone)]
+struct SchemaBody {
+    up: Vec<Statement>,
+    down: Vec<Statement>,
 }
 
 impl Migration {
@@ -37,8 +48,46 @@ impl Migration {
             name: name.into(),
             up: up.into(),
             down: down.into(),
+            schema: None,
         }
     }
+
+    /// A migration written with the schema builder. The statements are rendered for the connected
+    /// database when the migrator runs or rolls it back, so one migration serves every database.
+    /// A statement that cannot be rendered fails the migration with that error, before any of its
+    /// SQL runs. The migration keeps the same transaction and batch behaviour as an SQL one.
+    pub fn schema(name: impl Into<String>, up: Vec<Statement>, down: Vec<Statement>) -> Self {
+        Self {
+            name: name.into(),
+            up: String::new(),
+            down: String::new(),
+            schema: Some(SchemaBody { up, down }),
+        }
+    }
+
+    /// What `run` executes, for `driver`: the SQL scripts, in order.
+    fn up_scripts(&self, driver: Driver) -> Result<Vec<String>, Error> {
+        match &self.schema {
+            Some(body) => render(&body.up, driver),
+            None => Ok(vec![self.up.clone()]),
+        }
+    }
+
+    /// What `rollback` executes, for `driver`.
+    fn down_scripts(&self, driver: Driver) -> Result<Vec<String>, Error> {
+        match &self.schema {
+            Some(body) => render(&body.down, driver),
+            None => Ok(vec![self.down.clone()]),
+        }
+    }
+}
+
+fn render(statements: &[Statement], driver: Driver) -> Result<Vec<String>, Error> {
+    let mut sql = Vec::new();
+    for statement in statements {
+        sql.extend(statement.try_to_sql(driver)?);
+    }
+    Ok(sql)
 }
 
 /// Whether a migration has run. `Applied` carries the batch it ran in.
@@ -146,7 +195,7 @@ impl Migrator {
             }
             let up = read_file(&path.join("up.sql"))?;
             let down = read_file(&path.join("down.sql"))?;
-            migrations.push(Migration { name, up, down });
+            migrations.push(Migration::new(name, up, down));
         }
         Self::new(migrations)
     }
@@ -187,13 +236,16 @@ impl Migrator {
         let batch = i64::from(max.unwrap_or(0)) + 1;
         let mut names = Vec::with_capacity(pending.len());
         for migration in pending {
+            let scripts = migration.up_scripts(db.driver())?;
             let mut tx = Transaction::begin(&db.pool).await?;
-            backend::run_script(Target::Tx(&mut tx.inner), &migration.up)
-                .await
-                .map_err(|source| Error::MigrationFailed {
-                    name: migration.name.clone(),
-                    source,
-                })?;
+            for script in &scripts {
+                backend::run_script(Target::Tx(&mut tx.inner), script)
+                    .await
+                    .map_err(|source| Error::MigrationFailed {
+                        name: migration.name.clone(),
+                        source,
+                    })?;
+            }
             let (sql, values) = prepared(
                 db.driver(),
                 &format!("INSERT INTO {TABLE} (version, batch) VALUES (?, ?)"),
@@ -276,13 +328,16 @@ impl Migrator {
         }
         let names = to_revert.iter().map(|m| m.name.clone()).collect();
         for migration in to_revert {
+            let scripts = migration.down_scripts(db.driver())?;
             let mut tx = Transaction::begin(&db.pool).await?;
-            backend::run_script(Target::Tx(&mut tx.inner), &migration.down)
-                .await
-                .map_err(|source| Error::RollbackFailed {
-                    name: migration.name.clone(),
-                    source,
-                })?;
+            for script in &scripts {
+                backend::run_script(Target::Tx(&mut tx.inner), script)
+                    .await
+                    .map_err(|source| Error::RollbackFailed {
+                        name: migration.name.clone(),
+                        source,
+                    })?;
+            }
             let (sql, values) = prepared(
                 db.driver(),
                 &format!("DELETE FROM {TABLE} WHERE version = ?"),

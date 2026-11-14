@@ -297,6 +297,25 @@ let status = migrator.status(&db).await?;  // each migration as Applied (with it
 migrator.rollback(&db).await?;             // reverts the last batch, in reverse order
 ```
 
+A migration can also be written in code with the schema builder, so one migration serves every database. `Migration::schema(name, up, down)` takes the `up` and `down` statements, and the migrator renders them for the connected database when it runs or rolls back the migration:
+
+```rust
+use orbit_orm::{schema, Migration, Migrator};
+
+let users = Migration::schema(
+    "20261108000000_create_users",
+    vec![schema::create("users", |t| {
+        t.id();
+        t.string("email");
+        t.unique(["email"]);
+    })],
+    vec![schema::drop_if_exists("users")],
+);
+let migrator = Migrator::new(vec![users])?;
+```
+
+A statement that cannot be rendered (an invalid table name, for example) fails the migration with that error before any of its SQL runs. Batches, the per-migration transaction and the DDL caveat below are the same as for SQL migrations. The public `up` and `down` fields of a schema migration are empty.
+
 `migrations!("migrations", "20261108000000_create_users")` embeds the files in the binary at build time. List the names by hand; a missing file is a build error.
 
 Migrations are recorded in Diesel's `__diesel_schema_migrations` table, so a database that Diesel migrated keeps its history. `run`, `status` and `rollback` add the `batch` column to a table that has only Diesel's columns, so nothing needs to be imported first. `unmatched_diesel_versions` lists the versions in the table that have no folder in the migrator.
