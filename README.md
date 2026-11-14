@@ -305,6 +305,30 @@ Each recorded migration has its batch number. Each migration runs in its own tra
 
 `run` and `rollback` hold a lock named after the database: a named lock on MySQL, an advisory lock on PostgreSQL. A second process waits up to 10 seconds, then fails with `MigrationsLocked`. Change the wait with `Migrator::with_lock_timeout`. SQLite has no named lock, so its lock covers one process only; see [docs/laravel-differences.md](docs/laravel-differences.md).
 
+## Schema builder
+
+`orbit_orm::schema` describes a table once and renders it for SQLite, MySQL and MariaDB, and PostgreSQL, after Laravel's `Schema::create` and `Blueprint`:
+
+```rust
+use orbit_orm::schema::{self, Action};
+
+let posts = schema::create("posts", |t| {
+    t.id();
+    t.string("title");
+    t.text("body").nullable();
+    t.big_integer("user_id");
+    t.foreign("user_id").references("users", "id").on_delete(Action::Restrict);
+    t.unique(["title"]);
+    t.timestamps();
+});
+
+for sql in posts.to_sql(db.driver()) {
+    orbit_orm::raw::execute(&db, &sql, &[]).await?;
+}
+```
+
+`to_sql` returns one SQL statement per element, to run in order: PostgreSQL and SQLite create a plain `index` with a separate `CREATE INDEX`. Columns are `NOT NULL` unless `nullable()`. `id()` is `BIGINT AUTO_INCREMENT PRIMARY KEY` on MySQL, `BIGSERIAL PRIMARY KEY` on PostgreSQL and `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. `string` is `VARCHAR(255)` (`TEXT` on SQLite; change the length with `.length(n)`). Also: `text`, `integer`, `big_integer`, `boolean`, `date_time`, `timestamps`, `index`, `schema::drop` and `schema::drop_if_exists`. Names follow the query builder's rule, so `try_to_sql` returns `Error::InvalidIdentifier` for a name that is empty or has a quote character; `to_sql` panics in that case.
+
 ## Tests
 
 The database tests run against the database that `ORBIT_DATABASE_URL` names. Run them once per database, with the matching feature:

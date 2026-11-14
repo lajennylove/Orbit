@@ -14,6 +14,7 @@ mod migrate;
 mod model;
 mod query;
 pub mod raw;
+pub mod schema;
 mod transaction;
 mod value;
 

@@ -112,7 +112,7 @@ impl Params {
 
 /// Checks a table or column name. It must not be empty, and must not contain a backtick or a
 /// double quote, which are the quote characters of the supported databases.
-fn validate(name: &str) -> Result<(), Error> {
+pub(crate) fn validate(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.contains(['`', '"']) {
         return Err(Error::InvalidIdentifier(name.to_owned()));
     }
