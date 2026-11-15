@@ -68,6 +68,9 @@ impl Column {
     /// `$precision` argument of Laravel's `dateTime` and `timestamp` (default 0): `DATETIME(p)`
     /// or `TIMESTAMP(p)` on MySQL, `TIMESTAMP(p) WITHOUT TIME ZONE` on PostgreSQL. SQLite keeps
     /// `DATETIME`. It has no effect on other types.
+    ///
+    /// The valid range is 0 to 6. Orbit does not check it: MySQL and MariaDB reject a larger
+    /// value, and PostgreSQL lowers it to 6 with a warning.
     pub fn precision(&mut self, precision: u32) -> &mut Self {
         if let ColumnType::DateTime(p) | ColumnType::Timestamp(p) = &mut self.ty {
             *p = precision;
@@ -98,7 +101,8 @@ impl Column {
     /// Modifies this existing column instead of adding it, as Laravel's `->change()`. It only
     /// works inside [`schema::table`](super::table): the column takes the type, nullability and
     /// default described here. SQLite cannot change a column in place, so rendering it there is
-    /// [`Error::Unsupported`]; so is changing an `id` column.
+    /// [`Error::Unsupported`]; so is changing an `id` column, or a column marked
+    /// [`primary`](Self::primary), on every database.
     pub fn change(&mut self) -> &mut Self {
         self.change = true;
         self

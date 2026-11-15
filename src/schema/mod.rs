@@ -27,6 +27,9 @@
 //! A [`Statement`] is only a description. [`Statement::to_sql`] renders it for a [`Driver`] as a
 //! list of statements to run in order: PostgreSQL and SQLite create a plain index with a separate
 //! `CREATE INDEX`, and sqlx does not run several statements in one string on every database.
+//!
+//! [`statement`] runs SQL as written, as Laravel's `DB::statement` in a migration, and
+//! [`Statement::only`] limits any statement to one database family.
 
 mod blueprint;
 mod column;
@@ -171,8 +174,8 @@ pub fn drop_if_exists(table: &str) -> Statement {
 /// never uses it.
 ///
 /// [`to_sql`](Statement::to_sql) and [`try_to_sql`](Statement::try_to_sql) return the string
-/// unchanged, as one statement. An empty or wrong string is reported by the database when it
-/// runs.
+/// unchanged, as one statement. A wrong string is reported by the database when it runs. An
+/// empty string may do nothing, or be an error, depending on the database.
 ///
 /// ```
 /// use orbit_orm::schema::{self, Dialect};

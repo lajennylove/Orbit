@@ -169,6 +169,11 @@ impl Blueprint {
     /// A timestamp, as Laravel's `timestamp`: `TIMESTAMP` on MySQL, `TIMESTAMP(0) WITHOUT TIME
     /// ZONE` on PostgreSQL, `DATETIME` on SQLite. Set fractional seconds with `.precision(p)` and
     /// a default of the current time with `.use_current()`.
+    ///
+    /// On MySQL and MariaDB with `explicit_defaults_for_timestamp` off (the MariaDB default
+    /// before 10.10), the first `TIMESTAMP` column of a table that is `NOT NULL` and has no
+    /// default gets `DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` from the server.
+    /// Laravel's columns get the same. Add `.nullable()` or a default to avoid it.
     pub fn timestamp(&mut self, name: &str) -> &mut Column {
         self.add(name, ColumnType::Timestamp(0))
     }
@@ -253,6 +258,10 @@ impl Blueprint {
 
     /// Renames the column `from` to `to`: `ALTER TABLE ... RENAME COLUMN`. Only in
     /// [`schema::table`](super::table).
+    ///
+    /// `RENAME COLUMN` needs MySQL 8.0.3 or later, or MariaDB 10.5.2 or later. On older servers
+    /// Laravel falls back to `CHANGE old new <definition>`; Orbit does not, and the server
+    /// reports a syntax error.
     pub fn rename_column(&mut self, from: &str, to: &str) {
         self.commands.push(Command::RenameColumn {
             from: from.to_owned(),
@@ -268,8 +277,14 @@ impl Blueprint {
         });
     }
 
-    /// Drops the index `name`, as Laravel's `dropIndex('name')`; on MySQL and SQLite it drops a
-    /// unique index too. Only in [`schema::table`](super::table).
+    /// Drops the index `name`, as Laravel's `dropIndex('name')`. Only in
+    /// [`schema::table`](super::table).
+    ///
+    /// On MySQL it drops a unique index too. On SQLite it drops a unique only when `unique` added
+    /// it in `schema::table`: a unique declared in [`schema::create`](super::create) is an inline
+    /// constraint there and cannot be dropped this way. On PostgreSQL `unique` always adds a
+    /// constraint, and `DROP INDEX` cannot drop the index of a constraint. Orbit has no
+    /// `drop_unique` (Laravel's `dropUnique`).
     pub fn drop_index(&mut self, name: &str) {
         self.commands.push(Command::DropIndex {
             name: name.to_owned(),

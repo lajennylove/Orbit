@@ -56,6 +56,10 @@ impl Migration {
     /// database when the migrator runs or rolls it back, so one migration serves every database.
     /// A statement that cannot be rendered fails the migration with that error, before any of its
     /// SQL runs. The migration keeps the same transaction and batch behaviour as an SQL one.
+    ///
+    /// A [`schema::statement`](crate::schema::statement) runs its SQL as written. A statement
+    /// limited with [`Statement::only`] to another database family renders nothing, so it does
+    /// not run there.
     pub fn schema(name: impl Into<String>, up: Vec<Statement>, down: Vec<Statement>) -> Self {
         Self {
             name: name.into(),

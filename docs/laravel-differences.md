@@ -18,6 +18,27 @@ Orbit follows Laravel's Eloquent and query builder, with these exceptions. Each 
 - **`import_diesel_history` is deprecated since 0.1.1.** It was the step that upgraded a Diesel table, and it now only returns an empty list. Nothing needs to be called after the table is upgraded: `run`, `status` and `rollback` do that upgrade on first use, and Diesel's rows are already the applied history in the shared table. The function stays so existing callers still compile, and it can be removed in a later release. Callers that still use it get a deprecation warning, which `#[allow(deprecated)]` silences.
 - **The blocking API refuses async threads.** `orbit_orm::blocking` (feature `blocking`) runs the async queries on a runtime that the `Database` owns. Laravel has no sync or async split, so this follows Diesel, which Ignite uses. A blocking call on a thread that runs async code returns `Error::BlockingInRuntime`, rather than panicking inside Tokio or stalling the runtime. Call it from `tokio::task::spawn_blocking`, as Ignite does. Each call blocks its thread, so the blocking pool is the place for it. The `Database` shuts its runtime down in the background when dropped, so dropping it on an async thread is safe.
 
+## Schema builder
+
+`orbit_orm::schema` follows Laravel's `Schema` and `Blueprint`, with these exceptions.
+
+- **`create_if_not_exists` is not in Laravel.** A Laravel migration writes `if (! Schema::hasTable('users'))`, which asks a live connection. A schema migration here is rendered without one, so the check is in the SQL: `CREATE TABLE IF NOT EXISTS`. An existing table is left as it is, even when its columns differ. On PostgreSQL and SQLite a plain `index` is a separate `CREATE INDEX IF NOT EXISTS`, so it is still created when the table already exists. On MySQL the index is inside `CREATE TABLE` and is skipped with the table.
+- **One statement per operation.** In `schema::table`, each added column, changed column, rename, drop and key is its own statement, on every database. Laravel combines several into one `ALTER TABLE` on MySQL and PostgreSQL. The end schema is the same; only the number of statements differs.
+- **`.change()` is unsupported on SQLite.** SQLite cannot change a column in place. Laravel 11 rebuilds the table, which needs the live schema; Orbit returns `Error::Unsupported` instead. `.change()` on an `id()` column or on a column marked `.primary()` is `Error::Unsupported` on every database.
+- **Foreign keys on an existing SQLite table are skipped.** SQLite cannot add a constraint to an existing table. A `foreign` in `schema::table` renders nothing on SQLite, and `drop_foreign` renders nothing there, so `up` and `down` stay symmetric. Laravel 10 skipped it the same way; Laravel 11 rebuilds the table. A foreign key declared in `schema::create` works on SQLite as usual.
+- **`primary` on an existing SQLite table is unsupported.** For the same reason, `primary([...])`, `.primary()` and `id()` in `schema::table` are `Error::Unsupported` on SQLite.
+- **`Column::primary` is inline.** `.primary()` writes `PRIMARY KEY` at the end of the column definition. Laravel adds a separate primary key command for the table. The schema is the same.
+- **`drop_index` and `drop_foreign` take a name only.** Laravel also accepts an array of columns and builds the default name from it. Pass the name, for example `drop_foreign("posts_user_id_foreign")`.
+- **No `drop_unique` or `drop_primary`.** On MySQL `drop_index` drops a unique index too. On SQLite it drops a unique only when `unique` added it in `schema::table` (`CREATE UNIQUE INDEX`); a unique declared in `schema::create` is an inline constraint and cannot be dropped with it. On PostgreSQL `unique` always adds a constraint, and `DROP INDEX` cannot drop the index of a constraint, so `drop_index` does not drop a unique there.
+- **`rename_column` has no fallback for old MySQL servers.** It renders `RENAME COLUMN`, which needs MySQL 8.0.3 or later, or MariaDB 10.5.2 or later. Laravel falls back to `CHANGE old new <definition>` on older servers; Orbit does not.
+- **`timestamps()` creates `date_time` columns.** Laravel's `timestamps()` creates `timestamp` columns. Orbit 0.2.0 already rendered `DATETIME` (`TIMESTAMP(0) WITHOUT TIME ZONE` on PostgreSQL), and that SQL is kept. Declare `timestamp("created_at")` and `timestamp("updated_at")` for Laravel's types.
+- **`useCurrentOnUpdate` is not provided.** `use_current` sets the default to the current time. Nothing sets `ON UPDATE CURRENT_TIMESTAMP`; write it with `schema::statement` and `only(Dialect::MySql)` when it is needed.
+- **`TIMESTAMP` on MySQL and MariaDB.** With `explicit_defaults_for_timestamp` off (the MariaDB default before 10.10), the first `TIMESTAMP` column of a table that is `NOT NULL` and has no default gets `DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` from the server. Laravel's columns get the same. `.nullable()` or a default avoids it.
+- **`precision` is not range-checked.** The valid range is 0 to 6. MySQL and MariaDB reject a larger value, and PostgreSQL lowers it to 6 with a warning.
+- **`binary` is `BLOB` on MySQL**, as Laravel's `binary`, which holds up to 64 KB. For a `MEDIUMBLOB`, use `schema::statement` with `only(Dialect::MySql)`, as a Laravel migration uses `DB::statement` behind a driver check.
+- **`Statement::only` replaces a driver check.** A Laravel migration writes `if (DB::getDriverName() === 'mysql') { ... }`. A schema migration has no connection while it is built, so `.only(Dialect::MySql)` marks the statement instead, and it renders nothing on the other databases.
+- **`schema::statement` takes no bindings.** Laravel's `DB::statement` accepts bound values. `schema::statement` takes the SQL only, and runs it as written on every database. Quote values in the SQL yourself, and never put user input in it.
+
 ## Differences between databases
 
 Orbit uses one API on MySQL and MariaDB, PostgreSQL and SQLite. Each row below is a behaviour that differs by database, and how Orbit handles it. Laravel has the same kinds of differences between its grammars, and follows the same choices where Laravel has one.
@@ -48,6 +69,14 @@ Orbit uses one API on MySQL and MariaDB, PostgreSQL and SQLite. Each row below i
 | Column check on upgrade | `information_schema.columns` | `information_schema.columns` | `pragma_table_info` |
 | Migrations lock | named lock `GET_LOCK('orbit_migrations:<database>')` | advisory lock `pg_try_advisory_lock` on a key from an FNV-1a hash of `orbit_migrations:<database>`, polled until the timeout | process-local only (see below) |
 | Migration DDL | not rolled back on failure | rolled back on failure | rolled back on failure |
+| Schema: `.change()` | `MODIFY COLUMN` | `ALTER COLUMN ... TYPE`, then nullability and default | **`Error::Unsupported`** |
+| Schema: `foreign` and `drop_foreign` in `schema::table` | `ADD CONSTRAINT`, `DROP FOREIGN KEY` | `ADD CONSTRAINT`, `DROP CONSTRAINT` | render nothing |
+| Schema: `primary` and `id()` in `schema::table` | `ADD PRIMARY KEY`, `ADD COLUMN` | `ADD PRIMARY KEY`, `ADD COLUMN` | **`Error::Unsupported`** |
+| Schema: `unique` in `schema::table` | `ADD UNIQUE` | `ADD CONSTRAINT ... UNIQUE` | `CREATE UNIQUE INDEX` |
+| Schema: `drop_index` on a unique | drops it | does not drop it (it is a constraint) | drops it when `schema::table` added it |
+| Schema: plain index with `create_if_not_exists` | inside `CREATE TABLE`, skipped with the table | `CREATE INDEX IF NOT EXISTS` | `CREATE INDEX IF NOT EXISTS` |
+| Schema: `rename_column` | MySQL 8.0.3+, MariaDB 10.5.2+ | any | SQLite 3.25+ |
+| Schema: `drop_column` | any | any | SQLite 3.35+ |
 
 **Migrations table name.** The table is `__diesel_schema_migrations` on every database. The owner decided this, so it is a difference from Laravel's `migrations` on every driver, not only MySQL. Diesel and Orbit share the table on all three databases.
 

@@ -346,7 +346,92 @@ for sql in posts.to_sql(db.driver()) {
 }
 ```
 
-`to_sql` returns one SQL statement per element, to run in order: PostgreSQL and SQLite create a plain `index` with a separate `CREATE INDEX`. Columns are `NOT NULL` unless `nullable()`. `id()` is `BIGINT AUTO_INCREMENT PRIMARY KEY` on MySQL, `BIGSERIAL PRIMARY KEY` on PostgreSQL and `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. `string` is `VARCHAR(255)` (`TEXT` on SQLite; change the length with `.length(n)`). Also: `text`, `integer`, `big_integer`, `boolean`, `date_time`, `timestamps`, `index`, `schema::drop` and `schema::drop_if_exists`. Names follow the query builder's rule, so `try_to_sql` returns `Error::InvalidIdentifier` for a name that is empty or has a quote character; `to_sql` panics in that case.
+`to_sql` returns one SQL statement per element, to run in order: PostgreSQL and SQLite create a plain `index` with a separate `CREATE INDEX`. Columns are `NOT NULL` unless `nullable()`. `id()` is `BIGINT AUTO_INCREMENT PRIMARY KEY` on MySQL, `BIGSERIAL PRIMARY KEY` on PostgreSQL and `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite. `string` is `VARCHAR(255)` (`TEXT` on SQLite; change the length with `.length(n)`). Also: `text`, `integer`, `big_integer`, `boolean`, `date_time`, `timestamp`, `binary`, `timestamps`, `index`, `primary`, `schema::table`, `schema::create_if_not_exists`, `schema::drop`, `schema::drop_if_exists` and `schema::statement`. Names follow the query builder's rule, so `try_to_sql` returns `Error::InvalidIdentifier` for a name that is empty or has a quote character; `to_sql` panics in that case. An operation the database cannot do is `Error::Unsupported`.
+
+### Changing a table
+
+`schema::table` changes an existing table, as Laravel's `Schema::table`. A column described in the closure is added. A column that ends with `.change()` is modified: it takes the type, nullability and default described. `rename_column` and `drop_column` rename and drop columns:
+
+```rust
+use orbit_orm::schema;
+
+let posts = schema::table("posts", |t| {
+    t.string("subtitle").nullable();
+    t.string("title").length(100).change();
+    t.rename_column("body", "content");
+    t.drop_column("legacy_slug");
+});
+```
+
+Each operation is its own statement: the added columns first, then the changed columns, then the rest in the order they were called. SQLite cannot change a column in place, so `.change()` is `Error::Unsupported` there. `rename_column` needs MySQL 8.0.3 or MariaDB 10.5.2 or later, and `drop_column` needs SQLite 3.35 or later.
+
+### Indexes and keys
+
+`index`, `unique` and `foreign` take `.name()` to choose the name. Without it the name is Laravel's: `{table}_{columns}_index`, `{table}_{columns}_unique` or `{table}_{column}_foreign`. `drop_index` and `drop_foreign` take the name:
+
+```rust
+use orbit_orm::schema::{self, Action};
+
+let up = schema::table("posts", |t| {
+    t.index(["user_id"]).name("posts_author_index");
+    t.foreign("user_id").references("users", "id").on_delete(Action::Cascade);
+});
+
+let down = schema::table("posts", |t| {
+    t.drop_foreign("posts_user_id_foreign");
+    t.drop_index("posts_author_index");
+});
+```
+
+`primary(["team_id", "user_id"])` adds a primary key over several columns. For one column, `.primary()` on the column does the same, for a key that is not an `id()`, such as `t.string("token").length(64).primary()`.
+
+SQLite cannot add or drop a constraint on an existing table. There, a `foreign` in `schema::table` and `drop_foreign` render nothing, and `primary` in `schema::table` is `Error::Unsupported`. `drop_index` drops a unique index on MySQL, and on SQLite when `schema::table` added it. It does not drop a unique on PostgreSQL, and there is no `drop_unique`; see [docs/laravel-differences.md](docs/laravel-differences.md).
+
+### Column types
+
+`binary` is a column of raw bytes. `timestamp` is a `TIMESTAMP`, after Laravel's `timestamp`. `.precision(p)` sets the fractional seconds of a `date_time` or `timestamp`, from 0 to 6, and `.use_current()` makes the current time its default:
+
+```rust
+use orbit_orm::schema;
+
+let sessions = schema::create("sessions", |t| {
+    t.string("id").length(128).primary();
+    t.binary("payload");
+    t.timestamp("last_seen_at").precision(6).use_current();
+    t.date_time("expires_at").nullable();
+});
+```
+
+`binary` is `BLOB`, or `BYTEA` on PostgreSQL. `timestamp` is `TIMESTAMP` on MySQL, `TIMESTAMP(0) WITHOUT TIME ZONE` on PostgreSQL and `DATETIME` on SQLite. SQLite keeps `DATETIME` whatever the precision. `use_current` is `DEFAULT CURRENT_TIMESTAMP`, or `CURRENT_TIMESTAMP(p)` on MySQL when the precision is above 0.
+
+### Creating a table if it does not exist
+
+`schema::create_if_not_exists` renders `CREATE TABLE IF NOT EXISTS`. An existing table is left as it is, even when its columns differ:
+
+```rust
+use orbit_orm::schema;
+
+let users = schema::create_if_not_exists("users", |t| {
+    t.id();
+    t.string("email");
+    t.unique(["email"]);
+});
+```
+
+Laravel has no such method; a Laravel migration checks `Schema::hasTable` first. On PostgreSQL and SQLite, a plain `index` takes `CREATE INDEX IF NOT EXISTS`, so it is still created when the table already exists.
+
+### Raw statements
+
+`schema::statement` runs SQL as written, as Laravel's `DB::statement` in a migration. `.only(Dialect)` limits a statement to one database family; on the others it renders nothing:
+
+```rust
+use orbit_orm::schema::{self, Dialect};
+
+let seed = schema::statement("INSERT INTO roles (name) VALUES ('admin')");
+let avatar = schema::statement("ALTER TABLE users MODIFY avatar MEDIUMBLOB").only(Dialect::MySql);
+```
+
+The SQL is database-specific. Orbit does not check, quote or translate it, and runs the same string on every database unless `only` limits it. It takes no bound values, so it must not contain user input. `only` works on every statement, including `create`, `table` and `drop`.
 
 ## Tests
 
