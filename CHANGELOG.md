@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 - 2026-11-14
+
+### Added
+
+- `schema::table` (ALTER TABLE) with add, change, rename and drop column, index, unique, primary key and foreign key operations.
+- `schema::create_if_not_exists`.
+- `schema::statement` and `Statement::only(Dialect)` for a raw statement that runs on one database. Orbit's own generated code never uses it.
+- Blueprint: `binary`, `timestamp`, `primary([..])`, `rename_column`, `drop_column`, `drop_index(name)`, `drop_foreign(name)`.
+- Column: `change`, `primary`, `precision`, `use_current`.
+- `Index::name` and `ForeignKey::name`, and a public `Dialect`.
+
+### Changed
+
+- `index` and `unique` on a Blueprint now return `&mut Index`, so a call that ends in `t.unique([..])` with no `;` no longer compiles. Add a `;` to such calls.
+
 ## 0.2.0 - 2026-11-14
 
 ### Added
