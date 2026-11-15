@@ -404,6 +404,22 @@ let sessions = schema::create("sessions", |t| {
 
 `binary` is `BLOB`, or `BYTEA` on PostgreSQL. `timestamp` is `TIMESTAMP` on MySQL, `TIMESTAMP(0) WITHOUT TIME ZONE` on PostgreSQL and `DATETIME` on SQLite. SQLite keeps `DATETIME` whatever the precision. `use_current` is `DEFAULT CURRENT_TIMESTAMP`, or `CURRENT_TIMESTAMP(p)` on MySQL when the precision is above 0.
 
+`text` is `TEXT` on every database. On MySQL and MariaDB, `TEXT` holds up to 64 KB. For larger values, `medium_text` and `long_text` follow Laravel's `mediumText` and `longText`:
+
+```rust
+use orbit_orm::schema;
+
+let posts = schema::create("posts", |t| {
+    t.id();
+    t.string("title");
+    t.text("excerpt");
+    t.medium_text("summary");
+    t.long_text("content");
+});
+```
+
+`medium_text` is `MEDIUMTEXT` (up to 16 MB) and `long_text` is `LONGTEXT` (up to 4 GB) on MySQL and MariaDB. Both are `TEXT` on PostgreSQL, where text has no size limit, and on SQLite, where text is limited only by the database's size limits. WordPress stores post content and option and meta values as `LONGTEXT`.
+
 ### Creating a table if it does not exist
 
 `schema::create_if_not_exists` renders `CREATE TABLE IF NOT EXISTS`. An existing table is left as it is, even when its columns differ:

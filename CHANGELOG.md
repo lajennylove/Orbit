@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Blueprint: `medium_text`, `long_text`.
+
 ## 0.3.0 - 2026-11-14
 
 ### Added
