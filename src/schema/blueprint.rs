@@ -95,12 +95,13 @@ impl Index {
     }
 }
 
-/// Everything in a blueprint that is not a column, in call order. `schema::create` renders the
-/// indexes, primary keys and foreign keys inside `CREATE TABLE`; `schema::table` renders each
-/// command as its own statement after the added and changed columns, as Laravel's Blueprint
-/// orders them.
+/// Every operation of a blueprint, in call order. A column is recorded as `Column`, its index in
+/// the column list, at the point it is declared, as Laravel 11+ records each column as a command.
+/// `schema::create` renders the columns, then the indexes, primary keys and foreign keys inside
+/// `CREATE TABLE`; `schema::table` renders every command as its own statement in call order.
 #[derive(Debug, Clone)]
 enum Command {
+    Column(usize),
     Index(Index),
     Primary { columns: Vec<String> },
     Foreign(ForeignKey),
@@ -124,6 +125,7 @@ impl Blueprint {
     }
 
     fn add(&mut self, name: &str, ty: ColumnType) -> &mut Column {
+        self.commands.push(Command::Column(self.columns.len()));
         self.columns.push(Column::new(name, ty));
         self.columns.last_mut().expect("just pushed")
     }
@@ -327,6 +329,7 @@ impl Blueprint {
         let mut after = Vec::new();
         for command in &self.commands {
             match command {
+                Command::Column(_) => {}
                 Command::Index(index) => {
                     let columns = column_list(driver, &index.columns)?;
                     let name = index.name_for(table)?;
@@ -376,9 +379,9 @@ impl Blueprint {
         Ok(out)
     }
 
-    /// Renders the changes to an existing table, one statement per operation: the added columns,
-    /// then the changed columns, then the other commands in call order. A foreign key and
-    /// `drop_foreign` render nothing on SQLite.
+    /// Renders the changes to an existing table, one statement per operation, in call order as
+    /// Laravel 11+ does: an added or changed column renders where it was declared, among the
+    /// other commands. A foreign key and `drop_foreign` render nothing on SQLite.
     pub(crate) fn render_alter(
         &self,
         driver: Driver,
@@ -394,32 +397,40 @@ impl Blueprint {
         let alter = format!("ALTER TABLE {}", q(table));
 
         let mut out = Vec::new();
-        for column in self.columns.iter().filter(|c| !c.change) {
-            if (column.ty == ColumnType::Id || column.primary) && dialect == Dialect::Sqlite {
-                return Err(unsupported("adding a primary key column"));
-            }
-            out.push(format!(
-                "{alter} ADD COLUMN {}",
-                column.render(driver, dialect)?
-            ));
-        }
-        for column in self.columns.iter().filter(|c| c.change) {
-            if dialect == Dialect::Sqlite {
-                return Err(unsupported("changing a column"));
-            }
-            if column.ty == ColumnType::Id {
-                return Err(unsupported("changing an id column"));
-            }
-            if column.primary {
-                return Err(unsupported("changing a column into a primary key"));
-            }
-            out.push(match dialect {
-                Dialect::Postgres => format!("{alter} {}", column.render_change_postgres(driver)?),
-                _ => format!("{alter} MODIFY COLUMN {}", column.render(driver, dialect)?),
-            });
-        }
         for command in &self.commands {
             match command {
+                Command::Column(i) => {
+                    let column = &self.columns[*i];
+                    if column.change {
+                        if dialect == Dialect::Sqlite {
+                            return Err(unsupported("changing a column"));
+                        }
+                        if column.ty == ColumnType::Id {
+                            return Err(unsupported("changing an id column"));
+                        }
+                        if column.primary {
+                            return Err(unsupported("changing a column into a primary key"));
+                        }
+                        out.push(match dialect {
+                            Dialect::Postgres => {
+                                format!("{alter} {}", column.render_change_postgres(driver)?)
+                            }
+                            _ => {
+                                format!("{alter} MODIFY COLUMN {}", column.render(driver, dialect)?)
+                            }
+                        });
+                    } else {
+                        if (column.ty == ColumnType::Id || column.primary)
+                            && dialect == Dialect::Sqlite
+                        {
+                            return Err(unsupported("adding a primary key column"));
+                        }
+                        out.push(format!(
+                            "{alter} ADD COLUMN {}",
+                            column.render(driver, dialect)?
+                        ));
+                    }
+                }
                 Command::Index(index) => {
                     let columns = column_list(driver, &index.columns)?;
                     let name = q(&index.name_for(table)?);

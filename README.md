@@ -363,7 +363,7 @@ let posts = schema::table("posts", |t| {
 });
 ```
 
-Each operation is its own statement: the added columns first, then the changed columns, then the rest in the order they were called. SQLite cannot change a column in place, so `.change()` is `Error::Unsupported` there. `rename_column` needs MySQL 8.0.3 or MariaDB 10.5.2 or later, and `drop_column` needs SQLite 3.35 or later.
+Each operation is its own statement, run in the order it was called, as in Laravel 11 and later. So `t.drop_column("slug"); t.string("slug");` drops the column and adds it again, and `t.rename_column("name", "full_name"); t.string("name");` renames a column and adds a new one under the old name. SQLite cannot change a column in place, so `.change()` is `Error::Unsupported` there. On SQLite, a column added to a table that has rows cannot take `use_current` ("Cannot add a column with non-constant default"), and a `NOT NULL` column needs a default; Laravel has the same limit. `rename_column` needs MySQL 8.0.3 or MariaDB 10.5.2 or later, or SQLite 3.25 or later, and `drop_column` needs SQLite 3.35 or later.
 
 ### Indexes and keys
 
@@ -414,7 +414,9 @@ use orbit_orm::schema;
 let users = schema::create_if_not_exists("users", |t| {
     t.id();
     t.string("email");
+    t.string("name");
     t.unique(["email"]);
+    t.index(["name"]);
 });
 ```
 

@@ -5,7 +5,7 @@
 mod common;
 
 use orbit_orm::schema;
-use orbit_orm::{Database, Driver, Error, Value, raw};
+use orbit_orm::{Database, Driver, Error, PoolOptions, Value, raw};
 
 /// Any enabled driver, for the tests whose result does not depend on the dialect.
 fn any() -> Driver {
@@ -38,14 +38,29 @@ fn change() -> schema::Statement {
     })
 }
 
-/// Calls in a mixed order: Laravel renders added columns, then changed columns, then the other
-/// commands in call order.
+/// Calls in a mixed order: Laravel 11+ renders every operation in call order (Ruling R16).
 fn mixed() -> schema::Statement {
     schema::table("users", |t| {
         t.drop_column("a");
         t.string("b").change();
         t.rename_column("c", "d");
         t.integer("e");
+    })
+}
+
+/// Drops a column and adds it again: only call order makes this work.
+fn drop_then_readd() -> schema::Statement {
+    schema::table("users", |t| {
+        t.drop_column("score");
+        t.integer("score").default(0);
+    })
+}
+
+/// Renames a column and adds a new one under the old name.
+fn rename_then_readd() -> schema::Statement {
+    schema::table("users", |t| {
+        t.rename_column("name", "full_name");
+        t.string("name").nullable();
     })
 }
 
@@ -90,10 +105,24 @@ fn renders_mysql() {
     assert_eq!(
         mixed().to_sql(Driver::MySql),
         vec![
-            "ALTER TABLE `users` ADD COLUMN `e` INTEGER NOT NULL",
-            "ALTER TABLE `users` MODIFY COLUMN `b` VARCHAR(255) NOT NULL",
             "ALTER TABLE `users` DROP COLUMN `a`",
+            "ALTER TABLE `users` MODIFY COLUMN `b` VARCHAR(255) NOT NULL",
             "ALTER TABLE `users` RENAME COLUMN `c` TO `d`",
+            "ALTER TABLE `users` ADD COLUMN `e` INTEGER NOT NULL",
+        ]
+    );
+    assert_eq!(
+        drop_then_readd().to_sql(Driver::MySql),
+        vec![
+            "ALTER TABLE `users` DROP COLUMN `score`",
+            "ALTER TABLE `users` ADD COLUMN `score` INTEGER NOT NULL DEFAULT 0",
+        ]
+    );
+    assert_eq!(
+        rename_then_readd().to_sql(Driver::MySql),
+        vec![
+            "ALTER TABLE `users` RENAME COLUMN `name` TO `full_name`",
+            "ALTER TABLE `users` ADD COLUMN `name` VARCHAR(255) NULL",
         ]
     );
     assert_eq!(
@@ -138,11 +167,25 @@ fn renders_postgres() {
     assert_eq!(
         mixed().to_sql(Driver::Postgres),
         vec![
-            "ALTER TABLE \"users\" ADD COLUMN \"e\" INTEGER NOT NULL",
+            "ALTER TABLE \"users\" DROP COLUMN \"a\"",
             "ALTER TABLE \"users\" ALTER COLUMN \"b\" TYPE VARCHAR(255), \
              ALTER COLUMN \"b\" SET NOT NULL, ALTER COLUMN \"b\" DROP DEFAULT",
-            "ALTER TABLE \"users\" DROP COLUMN \"a\"",
             "ALTER TABLE \"users\" RENAME COLUMN \"c\" TO \"d\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"e\" INTEGER NOT NULL",
+        ]
+    );
+    assert_eq!(
+        drop_then_readd().to_sql(Driver::Postgres),
+        vec![
+            "ALTER TABLE \"users\" DROP COLUMN \"score\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"score\" INTEGER NOT NULL DEFAULT 0",
+        ]
+    );
+    assert_eq!(
+        rename_then_readd().to_sql(Driver::Postgres),
+        vec![
+            "ALTER TABLE \"users\" RENAME COLUMN \"name\" TO \"full_name\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"name\" VARCHAR(255) NULL",
         ]
     );
     assert_eq!(
@@ -174,6 +217,20 @@ fn renders_sqlite() {
         vec![
             "ALTER TABLE \"users\" RENAME COLUMN \"name\" TO \"full_name\"",
             "ALTER TABLE \"users\" DROP COLUMN \"nick\"",
+        ]
+    );
+    assert_eq!(
+        drop_then_readd().to_sql(Driver::Sqlite),
+        vec![
+            "ALTER TABLE \"users\" DROP COLUMN \"score\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"score\" INTEGER NOT NULL DEFAULT 0",
+        ]
+    );
+    assert_eq!(
+        rename_then_readd().to_sql(Driver::Sqlite),
+        vec![
+            "ALTER TABLE \"users\" RENAME COLUMN \"name\" TO \"full_name\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"name\" TEXT NULL",
         ]
     );
     assert_eq!(
@@ -213,10 +270,10 @@ fn adding_an_id_is_unsupported_on_sqlite() {
     }
 }
 
-/// Added columns, then the other commands in call order, on SQLite too.
+/// Every operation in call order, on SQLite too (Ruling R16).
 #[cfg(feature = "sqlite")]
 #[test]
-fn orders_added_columns_first_on_sqlite() {
+fn renders_in_call_order_on_sqlite() {
     let statement = schema::table("users", |t| {
         t.drop_column("a");
         t.rename_column("c", "d");
@@ -225,9 +282,9 @@ fn orders_added_columns_first_on_sqlite() {
     assert_eq!(
         statement.to_sql(Driver::Sqlite),
         vec![
-            "ALTER TABLE \"users\" ADD COLUMN \"e\" INTEGER NOT NULL",
             "ALTER TABLE \"users\" DROP COLUMN \"a\"",
             "ALTER TABLE \"users\" RENAME COLUMN \"c\" TO \"d\"",
+            "ALTER TABLE \"users\" ADD COLUMN \"e\" INTEGER NOT NULL",
         ]
     );
 }
@@ -296,18 +353,26 @@ fn alter_only_commands_are_errors_in_create() {
     }
 }
 
-/// Indexes and foreign keys inside `schema::table` render after the added columns; the exact SQL
-/// per driver is in `tests/schema_keys.rs`.
+/// Indexes and foreign keys inside `schema::table` render where they were called, among the
+/// columns (Ruling R16); the exact SQL per driver is in `tests/schema_keys.rs`.
 #[test]
-fn indexes_and_foreign_keys_in_table_render_after_the_columns() {
+fn indexes_and_foreign_keys_in_table_render_in_call_order() {
     let statement = schema::table("t", |t| {
-        t.index(["a"]);
-        t.foreign("a").references("u", "id");
         t.integer("a");
+        t.index(["a"]);
+        t.integer("b");
     });
     let sql = statement.to_sql(any());
-    assert!(sql[0].contains("ADD COLUMN"), "{sql:?}");
+    assert_eq!(sql.len(), 3, "{sql:?}");
+    assert!(
+        sql[0].contains("ADD COLUMN") && sql[0].contains('a'),
+        "{sql:?}"
+    );
     assert!(sql[1].contains("t_a_index"), "{sql:?}");
+    assert!(
+        sql[2].contains("ADD COLUMN") && sql[2].contains('b'),
+        "{sql:?}"
+    );
 }
 
 #[test]
@@ -364,7 +429,16 @@ async fn the_altered_table_works_on_the_database() {
         eprintln!("skipped: ORBIT_DATABASE_URL is not set");
         return;
     };
-    let db = Database::connect(&url).await.expect("connects");
+    // One connection, as the migrator runs each migration in one transaction. A second SQLite
+    // connection keeps the schema it read before another connection changed it, and SQLite checks
+    // `ADD COLUMN` and `DROP COLUMN` against that stale schema ("duplicate column name").
+    let options = PoolOptions {
+        max_connections: 1,
+        ..PoolOptions::default()
+    };
+    let db = Database::connect_with(&url, options)
+        .await
+        .expect("connects");
     let driver = db.driver();
     run(&db, &schema::drop_if_exists("alter_items")).await;
 
@@ -404,7 +478,30 @@ async fn the_altered_table_works_on_the_database() {
     }
     assert_eq!(columns(&db, "alter_items").await, ["id", "title", "score"]);
 
-    let title = if common::on_sqlite(driver) {
+    // Call order (Ruling R16): drop a column and add it again, then rename one and add a new
+    // column under the old name.
+    run(
+        &db,
+        &schema::table("alter_items", |t| {
+            t.drop_column("score");
+            t.integer("score").default(7);
+        }),
+    )
+    .await;
+    run(
+        &db,
+        &schema::table("alter_items", |t| {
+            t.rename_column("title", "heading");
+            t.string("title").nullable();
+        }),
+    )
+    .await;
+    assert_eq!(
+        columns(&db, "alter_items").await,
+        ["id", "heading", "score", "title"]
+    );
+
+    let heading = if common::on_sqlite(driver) {
         "'first'"
     } else {
         // The changed column takes NULL now.
@@ -412,7 +509,7 @@ async fn the_altered_table_works_on_the_database() {
     };
     raw::execute(
         &db,
-        &format!("INSERT INTO alter_items (title) VALUES ({title})"),
+        &format!("INSERT INTO alter_items (heading) VALUES ({heading})"),
         &[],
     )
     .await

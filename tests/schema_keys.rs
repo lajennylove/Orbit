@@ -69,10 +69,11 @@ fn members() -> schema::Statement {
     })
 }
 
-/// Index commands on an existing table. The added column is declared last and still renders
-/// first.
+/// Index commands on an existing table, rendered in call order (Ruling R16): the column is added
+/// before the unique index that covers it.
 fn keys_in_table() -> schema::Statement {
     schema::table("posts", |t| {
+        t.string("slug");
         t.index(["user_id"]);
         t.unique(["slug"]).name("posts_slug_key");
         t.foreign("user_id")
@@ -80,7 +81,6 @@ fn keys_in_table() -> schema::Statement {
             .on_delete(Action::Cascade);
         t.drop_index("posts_old_index");
         t.drop_foreign("posts_old_foreign");
-        t.string("slug");
     })
 }
 

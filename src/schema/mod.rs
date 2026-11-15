@@ -125,8 +125,9 @@ fn creating(table: &str, f: impl FnOnce(&mut Blueprint), if_not_exists: bool) ->
 /// drop columns; `index`, `unique`, `primary` and `foreign` add keys; `drop_index` and
 /// `drop_foreign` drop them.
 ///
-/// Each operation renders as its own statement on every database: the added columns first, then
-/// the changed columns, then the other commands in the order they were called. PostgreSQL and
+/// Each operation renders as its own statement on every database, in the order it was called, as
+/// in Laravel 11 and later: `t.drop_column("x"); t.string("x");` drops the column and then adds
+/// it again, and `t.rename_column("a", "b"); t.string("a");` renames and then adds. PostgreSQL and
 /// SQLite add a plain index with `CREATE INDEX` and drop one with `DROP INDEX`, and SQLite adds a
 /// unique index with `CREATE UNIQUE INDEX`; the rest is `ALTER TABLE`. SQLite cannot add or drop
 /// a constraint on an existing table: a foreign key and `drop_foreign` render nothing there, and
