@@ -8,6 +8,10 @@ pub(crate) enum ColumnType {
     Id,
     String(u32),
     Text,
+    /// A `MEDIUMTEXT` on MySQL and MariaDB, `TEXT` elsewhere.
+    MediumText,
+    /// A `LONGTEXT` on MySQL and MariaDB, `TEXT` elsewhere.
+    LongText,
     Integer,
     BigInteger,
     Boolean,
@@ -180,6 +184,9 @@ impl Column {
             (ColumnType::String(_), Dialect::Sqlite) => "TEXT".to_owned(),
             (ColumnType::String(n), _) => format!("VARCHAR({n})"),
             (ColumnType::Text, _) => "TEXT".to_owned(),
+            (ColumnType::MediumText, Dialect::MySql) => "MEDIUMTEXT".to_owned(),
+            (ColumnType::LongText, Dialect::MySql) => "LONGTEXT".to_owned(),
+            (ColumnType::MediumText | ColumnType::LongText, _) => "TEXT".to_owned(),
             (ColumnType::Integer, _) => "INTEGER".to_owned(),
             (ColumnType::BigInteger, Dialect::Sqlite) => "INTEGER".to_owned(),
             (ColumnType::BigInteger, _) => "BIGINT".to_owned(),

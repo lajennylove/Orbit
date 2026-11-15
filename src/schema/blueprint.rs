@@ -146,6 +146,21 @@ impl Blueprint {
         self.add(name, ColumnType::Text)
     }
 
+    /// A `MEDIUMTEXT` column (up to 16 MB) on MySQL and MariaDB, as Laravel's `mediumText`. It is
+    /// `TEXT` on PostgreSQL, which has no size limit, and on SQLite, where text is limited only by
+    /// the database's size limits.
+    pub fn medium_text(&mut self, name: &str) -> &mut Column {
+        self.add(name, ColumnType::MediumText)
+    }
+
+    /// A `LONGTEXT` column (up to 4 GB) on MySQL and MariaDB, as Laravel's `longText`. It is `TEXT`
+    /// on PostgreSQL, which has no size limit, and on SQLite, where text is limited only by the
+    /// database's size limits. WordPress uses `LONGTEXT` for post content and for option and meta
+    /// values.
+    pub fn long_text(&mut self, name: &str) -> &mut Column {
+        self.add(name, ColumnType::LongText)
+    }
+
     /// An `INTEGER` column.
     pub fn integer(&mut self, name: &str) -> &mut Column {
         self.add(name, ColumnType::Integer)
