@@ -11,17 +11,22 @@ pub(crate) enum ColumnType {
     Integer,
     BigInteger,
     Boolean,
-    DateTime,
+    /// A date and time without a time zone, with its fractional-second precision.
+    DateTime(u32),
+    /// A `TIMESTAMP`, with its fractional-second precision.
+    Timestamp(u32),
+    Binary,
 }
 
-/// A column of a table being created or changed. Chain `nullable`, `default`, `length`,
-/// `primary` and `change` on it.
+/// A column of a table being created or changed. Chain `nullable`, `default`, `use_current`,
+/// `length`, `precision`, `primary` and `change` on it.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub(crate) name: String,
     pub(crate) ty: ColumnType,
     nullable: bool,
     default: Option<Value>,
+    use_current: bool,
     pub(crate) primary: bool,
     pub(crate) change: bool,
 }
@@ -33,6 +38,7 @@ impl Column {
             ty,
             nullable: false,
             default: None,
+            use_current: false,
             primary: false,
             change: false,
         }
@@ -55,6 +61,26 @@ impl Column {
         if let ColumnType::String(n) = &mut self.ty {
             *n = length;
         }
+        self
+    }
+
+    /// Sets the fractional-second precision of a `date_time` or `timestamp` column, as the
+    /// `$precision` argument of Laravel's `dateTime` and `timestamp` (default 0): `DATETIME(p)`
+    /// or `TIMESTAMP(p)` on MySQL, `TIMESTAMP(p) WITHOUT TIME ZONE` on PostgreSQL. SQLite keeps
+    /// `DATETIME`. It has no effect on other types.
+    pub fn precision(&mut self, precision: u32) -> &mut Self {
+        if let ColumnType::DateTime(p) | ColumnType::Timestamp(p) = &mut self.ty {
+            *p = precision;
+        }
+        self
+    }
+
+    /// Makes the current time the default of a `date_time` or `timestamp` column, as Laravel's
+    /// `->useCurrent()`: `DEFAULT CURRENT_TIMESTAMP`, or `CURRENT_TIMESTAMP(p)` on MySQL with a
+    /// precision p above 0. It takes the place of any `default` value. As in Laravel, it has no
+    /// effect on other types.
+    pub fn use_current(&mut self) -> &mut Self {
+        self.use_current = true;
         self
     }
 
@@ -93,9 +119,9 @@ impl Column {
         }
         let mut sql = format!("{name} {}", self.sql_type(dialect));
         sql.push_str(if self.nullable { " NULL" } else { " NOT NULL" });
-        if let Some(value) = &self.default {
+        if let Some(default) = self.default_sql(driver, dialect)? {
             sql.push_str(" DEFAULT ");
-            sql.push_str(&literal(value, driver, dialect)?);
+            sql.push_str(&default);
         }
         if self.primary {
             sql.push_str(" PRIMARY KEY");
@@ -114,14 +140,34 @@ impl Column {
         } else {
             "SET NOT NULL"
         };
-        let default = match &self.default {
-            Some(value) => format!("SET DEFAULT {}", literal(value, driver, Dialect::Postgres)?),
+        let default = match self.default_sql(driver, Dialect::Postgres)? {
+            Some(default) => format!("SET DEFAULT {default}"),
             None => "DROP DEFAULT".to_owned(),
         };
         Ok(format!(
             "ALTER COLUMN {name} TYPE {ty}, ALTER COLUMN {name} {null}, \
              ALTER COLUMN {name} {default}"
         ))
+    }
+
+    /// The SQL of the column's default, if it has one: the current time for `use_current` on a
+    /// date and time column, or else the literal `default` value.
+    fn default_sql(&self, driver: Driver, dialect: Dialect) -> Result<Option<String>, Error> {
+        if self.use_current {
+            match (self.ty, dialect) {
+                (ColumnType::DateTime(p) | ColumnType::Timestamp(p), Dialect::MySql) if p > 0 => {
+                    return Ok(Some(format!("CURRENT_TIMESTAMP({p})")));
+                }
+                (ColumnType::DateTime(_) | ColumnType::Timestamp(_), _) => {
+                    return Ok(Some("CURRENT_TIMESTAMP".to_owned()));
+                }
+                _ => {}
+            }
+        }
+        self.default
+            .as_ref()
+            .map(|value| literal(value, driver, dialect))
+            .transpose()
     }
 
     fn sql_type(&self, dialect: Dialect) -> String {
@@ -135,10 +181,18 @@ impl Column {
             (ColumnType::BigInteger, _) => "BIGINT".to_owned(),
             (ColumnType::Boolean, Dialect::Postgres) => "BOOLEAN".to_owned(),
             (ColumnType::Boolean, _) => "TINYINT(1)".to_owned(),
-            (ColumnType::DateTime, Dialect::Postgres) => {
-                "TIMESTAMP(0) WITHOUT TIME ZONE".to_owned()
+            (ColumnType::DateTime(p) | ColumnType::Timestamp(p), Dialect::Postgres) => {
+                format!("TIMESTAMP({p}) WITHOUT TIME ZONE")
             }
-            (ColumnType::DateTime, _) => "DATETIME".to_owned(),
+            (ColumnType::DateTime(_) | ColumnType::Timestamp(_), Dialect::Sqlite) => {
+                "DATETIME".to_owned()
+            }
+            (ColumnType::DateTime(0), _) => "DATETIME".to_owned(),
+            (ColumnType::DateTime(p), _) => format!("DATETIME({p})"),
+            (ColumnType::Timestamp(0), _) => "TIMESTAMP".to_owned(),
+            (ColumnType::Timestamp(p), _) => format!("TIMESTAMP({p})"),
+            (ColumnType::Binary, Dialect::Postgres) => "BYTEA".to_owned(),
+            (ColumnType::Binary, _) => "BLOB".to_owned(),
         }
     }
 }

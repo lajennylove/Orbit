@@ -159,9 +159,23 @@ impl Blueprint {
         self.add(name, ColumnType::Boolean)
     }
 
-    /// A date and time without a time zone: `DATETIME`, or `TIMESTAMP(0)` on PostgreSQL.
+    /// A date and time without a time zone: `DATETIME`, or `TIMESTAMP(0)` on PostgreSQL. Set
+    /// fractional seconds with `.precision(p)` and a default of the current time with
+    /// `.use_current()`.
     pub fn date_time(&mut self, name: &str) -> &mut Column {
-        self.add(name, ColumnType::DateTime)
+        self.add(name, ColumnType::DateTime(0))
+    }
+
+    /// A timestamp, as Laravel's `timestamp`: `TIMESTAMP` on MySQL, `TIMESTAMP(0) WITHOUT TIME
+    /// ZONE` on PostgreSQL, `DATETIME` on SQLite. Set fractional seconds with `.precision(p)` and
+    /// a default of the current time with `.use_current()`.
+    pub fn timestamp(&mut self, name: &str) -> &mut Column {
+        self.add(name, ColumnType::Timestamp(0))
+    }
+
+    /// A column of raw bytes, as Laravel's `binary`: `BLOB`, or `BYTEA` on PostgreSQL.
+    pub fn binary(&mut self, name: &str) -> &mut Column {
+        self.add(name, ColumnType::Binary)
     }
 
     /// Nullable `created_at` and `updated_at` columns.
