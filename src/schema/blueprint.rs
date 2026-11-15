@@ -25,10 +25,11 @@ impl Action {
     }
 }
 
-/// A foreign key under construction. Chain `references`, `on_delete` and `on_update`.
+/// A foreign key under construction. Chain `references`, `on_delete`, `on_update` and `name`.
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
     column: String,
+    name: Option<String>,
     target: Option<(String, String)>,
     on_delete: Option<Action>,
     on_update: Option<Action>,
@@ -52,27 +53,65 @@ impl ForeignKey {
         self.on_update = Some(action);
         self
     }
+
+    /// Names the constraint, as the second argument of Laravel's `$table->foreign('col', 'name')`.
+    /// Without it the name is `{table}_{column}_foreign`.
+    pub fn name(&mut self, name: &str) -> &mut Self {
+        self.name = Some(name.to_owned());
+        self
+    }
 }
 
+/// A plain or unique index under construction. Chain `name` to choose its name.
 #[derive(Debug, Clone)]
-struct Index {
+pub struct Index {
     columns: Vec<String>,
     unique: bool,
+    name: Option<String>,
+}
+
+impl Index {
+    /// Names the index, as the second argument of Laravel's `$table->index(['a'], 'name')`.
+    /// Without it the name is `{table}_{columns}_index`, or `{table}_{columns}_unique` for a
+    /// unique index.
+    pub fn name(&mut self, name: &str) -> &mut Self {
+        self.name = Some(name.to_owned());
+        self
+    }
+
+    /// The index's name, checked: the custom one, or the default for `table`.
+    fn name_for(&self, table: &str) -> Result<String, Error> {
+        match &self.name {
+            Some(name) => {
+                validate(name)?;
+                Ok(name.clone())
+            }
+            None => Ok(name_of(
+                table,
+                &self.columns,
+                if self.unique { "unique" } else { "index" },
+            )),
+        }
+    }
 }
 
 /// Everything in a blueprint that is not a column, in call order. `schema::create` renders the
-/// indexes and foreign keys inside `CREATE TABLE`; `schema::table` renders each command as its
-/// own `ALTER TABLE` after the added and changed columns, as Laravel's Blueprint orders them.
+/// indexes, primary keys and foreign keys inside `CREATE TABLE`; `schema::table` renders each
+/// command as its own statement after the added and changed columns, as Laravel's Blueprint
+/// orders them.
 #[derive(Debug, Clone)]
 enum Command {
     Index(Index),
+    Primary { columns: Vec<String> },
     Foreign(ForeignKey),
     RenameColumn { from: String, to: String },
     DropColumn { name: String },
+    DropIndex { name: String },
+    DropForeign { name: String },
 }
 
-/// The columns and commands (indexes, foreign keys, renames, drops) of a table, in the order they
-/// were added.
+/// The columns and commands (indexes, keys, renames, drops) of a table, in the order they were
+/// added.
 #[derive(Debug, Clone, Default)]
 pub struct Blueprint {
     columns: Vec<Column>,
@@ -131,34 +170,63 @@ impl Blueprint {
         self.date_time("updated_at").nullable();
     }
 
-    /// A unique constraint over `columns`, named `{table}_{columns}_unique`.
-    pub fn unique<I, S>(&mut self, columns: I)
+    /// A unique constraint over `columns`, named `{table}_{columns}_unique` unless `.name()`
+    /// gives another name.
+    pub fn unique<I, S>(&mut self, columns: I) -> &mut Index
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.add_index(columns, true)
+    }
+
+    /// A plain index over `columns`, named `{table}_{columns}_index` unless `.name()` gives
+    /// another name.
+    pub fn index<I, S>(&mut self, columns: I) -> &mut Index
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.add_index(columns, false)
+    }
+
+    fn add_index<I, S>(&mut self, columns: I, unique: bool) -> &mut Index
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         self.commands.push(Command::Index(Index {
             columns: collect(columns),
-            unique: true,
+            unique,
+            name: None,
         }));
+        match self.commands.last_mut() {
+            Some(Command::Index(index)) => index,
+            _ => unreachable!("just pushed an index"),
+        }
     }
 
-    /// A plain index over `columns`, named `{table}_{columns}_index`.
-    pub fn index<I, S>(&mut self, columns: I)
+    /// A primary key over `columns`, as Laravel's `$table->primary(['a', 'b'])`: the table
+    /// constraint `PRIMARY KEY (a, b)`. For a key of one column, `.primary()` on the column does
+    /// the same. In [`schema::table`](super::table) SQLite cannot add it: it is
+    /// [`Error::Unsupported`] there.
+    pub fn primary<I, S>(&mut self, columns: I)
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.commands.push(Command::Index(Index {
+        self.commands.push(Command::Primary {
             columns: collect(columns),
-            unique: false,
-        }));
+        });
     }
 
-    /// A foreign key on `column`, named `{table}_{column}_foreign`.
+    /// A foreign key on `column`, named `{table}_{column}_foreign` unless `.name()` gives another
+    /// name. In [`schema::table`](super::table) SQLite renders nothing, as SQLite cannot add a
+    /// constraint to an existing table.
     pub fn foreign(&mut self, column: &str) -> &mut ForeignKey {
         self.commands.push(Command::Foreign(ForeignKey {
             column: column.to_owned(),
+            name: None,
             target: None,
             on_delete: None,
             on_update: None,
@@ -182,6 +250,23 @@ impl Blueprint {
     /// [`schema::table`](super::table). SQLite needs version 3.35 or later.
     pub fn drop_column(&mut self, name: &str) {
         self.commands.push(Command::DropColumn {
+            name: name.to_owned(),
+        });
+    }
+
+    /// Drops the index `name`, as Laravel's `dropIndex('name')`; on MySQL and SQLite it drops a
+    /// unique index too. Only in [`schema::table`](super::table).
+    pub fn drop_index(&mut self, name: &str) {
+        self.commands.push(Command::DropIndex {
+            name: name.to_owned(),
+        });
+    }
+
+    /// Drops the foreign key `name`, as Laravel's `dropForeign('name')`. Only in
+    /// [`schema::table`](super::table). SQLite renders nothing, as it cannot drop a constraint
+    /// from an existing table and `foreign` added none there.
+    pub fn drop_foreign(&mut self, name: &str) {
+        self.commands.push(Command::DropForeign {
             name: name.to_owned(),
         });
     }
@@ -215,11 +300,10 @@ impl Blueprint {
             match command {
                 Command::Index(index) => {
                     let columns = column_list(driver, &index.columns)?;
+                    let name = index.name_for(table)?;
                     if index.unique {
-                        let name = name_of(table, &index.columns, "unique");
                         parts.push(format!("CONSTRAINT {} UNIQUE ({columns})", q(&name)));
                     } else {
-                        let name = name_of(table, &index.columns, "index");
                         match dialect {
                             Dialect::MySql => parts.push(format!("INDEX {} ({columns})", q(&name))),
                             _ => after.push(format!(
@@ -230,12 +314,21 @@ impl Blueprint {
                         }
                     }
                 }
+                Command::Primary { columns } => {
+                    parts.push(format!("PRIMARY KEY ({})", column_list(driver, columns)?));
+                }
                 Command::Foreign(_) => {}
                 Command::RenameColumn { .. } => {
                     return Err(unsupported("renaming a column in create"));
                 }
                 Command::DropColumn { .. } => {
                     return Err(unsupported("dropping a column in create"));
+                }
+                Command::DropIndex { .. } => {
+                    return Err(unsupported("dropping an index in create"));
+                }
+                Command::DropForeign { .. } => {
+                    return Err(unsupported("dropping a foreign key in create"));
                 }
             }
         }
@@ -254,8 +347,9 @@ impl Blueprint {
         Ok(out)
     }
 
-    /// Renders the changes to an existing table, one `ALTER TABLE` per operation: the added
-    /// columns, then the changed columns, then the other commands in call order.
+    /// Renders the changes to an existing table, one statement per operation: the added columns,
+    /// then the changed columns, then the other commands in call order. A foreign key and
+    /// `drop_foreign` render nothing on SQLite.
     pub(crate) fn render_alter(
         &self,
         driver: Driver,
@@ -272,7 +366,7 @@ impl Blueprint {
 
         let mut out = Vec::new();
         for column in self.columns.iter().filter(|c| !c.change) {
-            if column.ty == ColumnType::Id && dialect == Dialect::Sqlite {
+            if (column.ty == ColumnType::Id || column.primary) && dialect == Dialect::Sqlite {
                 return Err(unsupported("adding a primary key column"));
             }
             out.push(format!(
@@ -287,6 +381,9 @@ impl Blueprint {
             if column.ty == ColumnType::Id {
                 return Err(unsupported("changing an id column"));
             }
+            if column.primary {
+                return Err(unsupported("changing a column into a primary key"));
+            }
             out.push(match dialect {
                 Dialect::Postgres => format!("{alter} {}", column.render_change_postgres(driver)?),
                 _ => format!("{alter} MODIFY COLUMN {}", column.render(driver, dialect)?),
@@ -294,8 +391,35 @@ impl Blueprint {
         }
         for command in &self.commands {
             match command {
-                Command::Index(_) => return Err(unsupported("an index in table")),
-                Command::Foreign(_) => return Err(unsupported("a foreign key in table")),
+                Command::Index(index) => {
+                    let columns = column_list(driver, &index.columns)?;
+                    let name = q(&index.name_for(table)?);
+                    out.push(match (dialect, index.unique) {
+                        (Dialect::MySql, false) => format!("{alter} ADD INDEX {name} ({columns})"),
+                        (Dialect::MySql, true) => format!("{alter} ADD UNIQUE {name} ({columns})"),
+                        (Dialect::Postgres, true) => {
+                            format!("{alter} ADD CONSTRAINT {name} UNIQUE ({columns})")
+                        }
+                        (Dialect::Sqlite, true) => {
+                            format!("CREATE UNIQUE INDEX {name} ON {} ({columns})", q(table))
+                        }
+                        (_, false) => format!("CREATE INDEX {name} ON {} ({columns})", q(table)),
+                    });
+                }
+                Command::Primary { columns } => {
+                    let columns = column_list(driver, columns)?;
+                    if dialect == Dialect::Sqlite {
+                        return Err(unsupported("adding a primary key"));
+                    }
+                    out.push(format!("{alter} ADD PRIMARY KEY ({columns})"));
+                }
+                Command::Foreign(fk) => {
+                    // Rendered on SQLite too, so a missing target or a bad name is still an error.
+                    let constraint = fk.render(driver, table)?;
+                    if dialect != Dialect::Sqlite {
+                        out.push(format!("{alter} ADD {constraint}"));
+                    }
+                }
                 Command::RenameColumn { from, to } => {
                     validate(from)?;
                     validate(to)?;
@@ -305,6 +429,23 @@ impl Blueprint {
                     validate(name)?;
                     out.push(format!("{alter} DROP COLUMN {}", q(name)));
                 }
+                Command::DropIndex { name } => {
+                    validate(name)?;
+                    out.push(match dialect {
+                        Dialect::MySql => format!("{alter} DROP INDEX {}", q(name)),
+                        _ => format!("DROP INDEX {}", q(name)),
+                    });
+                }
+                Command::DropForeign { name } => {
+                    validate(name)?;
+                    match dialect {
+                        Dialect::MySql => out.push(format!("{alter} DROP FOREIGN KEY {}", q(name))),
+                        Dialect::Postgres => {
+                            out.push(format!("{alter} DROP CONSTRAINT {}", q(name)))
+                        }
+                        Dialect::Sqlite => {}
+                    }
+                }
             }
         }
         Ok(out)
@@ -312,7 +453,8 @@ impl Blueprint {
 }
 
 impl ForeignKey {
-    /// The `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...` clause, named for `table`.
+    /// The `CONSTRAINT ... FOREIGN KEY ... REFERENCES ...` clause, with its custom name or the
+    /// default one for `table`.
     fn render(&self, driver: Driver, table: &str) -> Result<String, Error> {
         let q = |name: &str| driver.quote(name);
         validate(&self.column)?;
@@ -324,7 +466,13 @@ impl ForeignKey {
         };
         validate(ref_table)?;
         validate(ref_column)?;
-        let name = name_of(table, std::slice::from_ref(&self.column), "foreign");
+        let name = match &self.name {
+            Some(name) => {
+                validate(name)?;
+                name.clone()
+            }
+            None => name_of(table, std::slice::from_ref(&self.column), "foreign"),
+        };
         let mut sql = format!(
             "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
             q(&name),

@@ -205,10 +205,54 @@ fn changing_a_column_is_unsupported_on_sqlite() {
 #[cfg(feature = "sqlite")]
 #[test]
 fn adding_an_id_is_unsupported_on_sqlite() {
-    assert!(matches!(
-        add_id().try_to_sql(Driver::Sqlite),
-        Err(Error::Unsupported { .. })
-    ));
+    match add_id().try_to_sql(Driver::Sqlite) {
+        Err(Error::Unsupported { operation, .. }) => {
+            assert_eq!(operation, "adding a primary key column")
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// Added columns, then the other commands in call order, on SQLite too.
+#[cfg(feature = "sqlite")]
+#[test]
+fn orders_added_columns_first_on_sqlite() {
+    let statement = schema::table("users", |t| {
+        t.drop_column("a");
+        t.rename_column("c", "d");
+        t.integer("e");
+    });
+    assert_eq!(
+        statement.to_sql(Driver::Sqlite),
+        vec![
+            "ALTER TABLE \"users\" ADD COLUMN \"e\" INTEGER NOT NULL",
+            "ALTER TABLE \"users\" DROP COLUMN \"a\"",
+            "ALTER TABLE \"users\" RENAME COLUMN \"c\" TO \"d\"",
+        ]
+    );
+}
+
+/// Changing a column into an auto-incrementing id is not a column change (Ruling R10).
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+#[test]
+fn changing_an_id_column_is_unsupported() {
+    let statement = schema::table("users", |t| {
+        t.id().change();
+    });
+    let drivers = [
+        #[cfg(feature = "mysql")]
+        Driver::MySql,
+        #[cfg(feature = "postgres")]
+        Driver::Postgres,
+    ];
+    for driver in drivers {
+        match statement.try_to_sql(driver) {
+            Err(Error::Unsupported { operation, .. }) => {
+                assert_eq!(operation, "changing an id column")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -252,24 +296,18 @@ fn alter_only_commands_are_errors_in_create() {
     }
 }
 
-/// Indexes and foreign keys inside `schema::table` come with the index commands; until then they
-/// are an error, never dropped in silence.
+/// Indexes and foreign keys inside `schema::table` render after the added columns; the exact SQL
+/// per driver is in `tests/schema_keys.rs`.
 #[test]
-fn indexes_and_foreign_keys_in_table_are_not_dropped_silently() {
-    let index = schema::table("t", |t| {
+fn indexes_and_foreign_keys_in_table_render_after_the_columns() {
+    let statement = schema::table("t", |t| {
         t.index(["a"]);
-    });
-    assert!(matches!(
-        index.try_to_sql(any()),
-        Err(Error::Unsupported { .. })
-    ));
-    let foreign = schema::table("t", |t| {
         t.foreign("a").references("u", "id");
+        t.integer("a");
     });
-    assert!(matches!(
-        foreign.try_to_sql(any()),
-        Err(Error::Unsupported { .. })
-    ));
+    let sql = statement.to_sql(any());
+    assert!(sql[0].contains("ADD COLUMN"), "{sql:?}");
+    assert!(sql[1].contains("t_a_index"), "{sql:?}");
 }
 
 #[test]

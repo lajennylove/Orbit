@@ -14,14 +14,15 @@ pub(crate) enum ColumnType {
     DateTime,
 }
 
-/// A column of a table being created or changed. Chain `nullable`, `default`, `length` and
-/// `change` on it.
+/// A column of a table being created or changed. Chain `nullable`, `default`, `length`,
+/// `primary` and `change` on it.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub(crate) name: String,
     pub(crate) ty: ColumnType,
     nullable: bool,
     default: Option<Value>,
+    pub(crate) primary: bool,
     pub(crate) change: bool,
 }
 
@@ -32,6 +33,7 @@ impl Column {
             ty,
             nullable: false,
             default: None,
+            primary: false,
             change: false,
         }
     }
@@ -56,6 +58,17 @@ impl Column {
         self
     }
 
+    /// Makes this column the table's primary key, as Laravel's `->primary()`: `PRIMARY KEY` at
+    /// the end of the column definition, for a key that is not an auto-incrementing `id`, such as
+    /// `t.string("id").length(64).primary()`. For a key over several columns, use
+    /// [`Blueprint::primary`](super::Blueprint::primary). In [`schema::table`](super::table)
+    /// SQLite cannot add it, and no database can take it with `.change()`: both are
+    /// [`Error::Unsupported`].
+    pub fn primary(&mut self) -> &mut Self {
+        self.primary = true;
+        self
+    }
+
     /// Modifies this existing column instead of adding it, as Laravel's `->change()`. It only
     /// works inside [`schema::table`](super::table): the column takes the type, nullability and
     /// default described here. SQLite cannot change a column in place, so rendering it there is
@@ -65,7 +78,7 @@ impl Column {
         self
     }
 
-    /// The column's SQL: its quoted name, type, nullability and default.
+    /// The column's SQL: its quoted name, type, nullability, default and `PRIMARY KEY`.
     pub(crate) fn render(&self, driver: Driver, dialect: Dialect) -> Result<String, Error> {
         crate::query::validate(&self.name)?;
         let name = driver.quote(&self.name);
@@ -83,6 +96,9 @@ impl Column {
         if let Some(value) = &self.default {
             sql.push_str(" DEFAULT ");
             sql.push_str(&literal(value, driver, dialect)?);
+        }
+        if self.primary {
+            sql.push_str(" PRIMARY KEY");
         }
         Ok(sql)
     }

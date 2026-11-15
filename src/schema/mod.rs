@@ -33,7 +33,7 @@ mod column;
 
 use crate::{Driver, Error};
 
-pub use blueprint::{Action, Blueprint, ForeignKey};
+pub use blueprint::{Action, Blueprint, ForeignKey, Index};
 pub use column::Column;
 
 /// The database families that differ in DDL. A [`Driver`] maps to one of these, so the SQL below
@@ -111,11 +111,15 @@ fn creating(table: &str, f: impl FnOnce(&mut Blueprint), if_not_exists: bool) ->
 
 /// Changes an existing table, as Laravel's `Schema::table`. A column described in the closure is
 /// added, or modified when it ends with `.change()`; `rename_column` and `drop_column` rename and
-/// drop columns.
+/// drop columns; `index`, `unique`, `primary` and `foreign` add keys; `drop_index` and
+/// `drop_foreign` drop them.
 ///
-/// Each operation renders as its own `ALTER TABLE` statement on every database: the added columns
-/// first, then the changed columns, then the other commands in the order they were called. An
-/// index or foreign key declared here is not rendered yet: it is [`Error::Unsupported`].
+/// Each operation renders as its own statement on every database: the added columns first, then
+/// the changed columns, then the other commands in the order they were called. PostgreSQL and
+/// SQLite add a plain index with `CREATE INDEX` and drop one with `DROP INDEX`, and SQLite adds a
+/// unique index with `CREATE UNIQUE INDEX`; the rest is `ALTER TABLE`. SQLite cannot add or drop
+/// a constraint on an existing table: a foreign key and `drop_foreign` render nothing there, and
+/// a primary key is [`Error::Unsupported`].
 pub fn table(table: &str, f: impl FnOnce(&mut Blueprint)) -> Statement {
     let mut blueprint = Blueprint::new();
     f(&mut blueprint);
