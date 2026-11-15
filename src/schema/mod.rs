@@ -1,4 +1,5 @@
-//! A database-neutral schema builder, after Laravel's `Schema::create` and `Blueprint`.
+//! A database-neutral schema builder, after Laravel's `Schema::create`, `Schema::table` and
+//! `Blueprint`.
 //!
 //! A migration describes a table once and the same code runs on SQLite, MySQL and MariaDB, and
 //! PostgreSQL:
@@ -15,6 +16,12 @@
 //!     t.unique(["title"]);
 //! });
 //! # let _ = posts;
+//!
+//! let rename = schema::table("posts", |t| {
+//!     t.string("subtitle").nullable();
+//!     t.rename_column("body", "content");
+//! });
+//! # let _ = rename;
 //! ```
 //!
 //! A [`Statement`] is only a description. [`Statement::to_sql`] renders it for a [`Driver`] as a
@@ -60,16 +67,60 @@ pub struct Statement {
 
 #[derive(Debug, Clone)]
 enum Kind {
-    Create { table: String, blueprint: Blueprint },
-    Drop { table: String, if_exists: bool },
+    Create {
+        table: String,
+        blueprint: Blueprint,
+        if_not_exists: bool,
+    },
+    Alter {
+        table: String,
+        blueprint: Blueprint,
+    },
+    Drop {
+        table: String,
+        if_exists: bool,
+    },
 }
 
 /// Creates a table. The closure describes its columns, indexes and foreign keys.
 pub fn create(table: &str, f: impl FnOnce(&mut Blueprint)) -> Statement {
+    creating(table, f, false)
+}
+
+/// Creates a table unless it exists: `CREATE TABLE IF NOT EXISTS`. A plain index that PostgreSQL
+/// and SQLite create with a separate statement takes `CREATE INDEX IF NOT EXISTS`.
+///
+/// Laravel has no such method; a Laravel migration writes `if (! Schema::hasTable(...))`. That
+/// needs a live connection, and a schema migration here is rendered without one, so the check is
+/// in the SQL instead. An existing table is left as it is, even when its columns differ.
+pub fn create_if_not_exists(table: &str, f: impl FnOnce(&mut Blueprint)) -> Statement {
+    creating(table, f, true)
+}
+
+fn creating(table: &str, f: impl FnOnce(&mut Blueprint), if_not_exists: bool) -> Statement {
     let mut blueprint = Blueprint::new();
     f(&mut blueprint);
     Statement {
         kind: Kind::Create {
+            table: table.to_owned(),
+            blueprint,
+            if_not_exists,
+        },
+    }
+}
+
+/// Changes an existing table, as Laravel's `Schema::table`. A column described in the closure is
+/// added, or modified when it ends with `.change()`; `rename_column` and `drop_column` rename and
+/// drop columns.
+///
+/// Each operation renders as its own `ALTER TABLE` statement on every database: the added columns
+/// first, then the changed columns, then the other commands in the order they were called. An
+/// index or foreign key declared here is not rendered yet: it is [`Error::Unsupported`].
+pub fn table(table: &str, f: impl FnOnce(&mut Blueprint)) -> Statement {
+    let mut blueprint = Blueprint::new();
+    f(&mut blueprint);
+    Statement {
+        kind: Kind::Alter {
             table: table.to_owned(),
             blueprint,
         },
@@ -110,11 +161,17 @@ impl Statement {
 
     /// Renders the statement for `driver`, or the error for an invalid name. A table, column or
     /// index column name must not be empty or contain a backtick or a double quote, the rule of
-    /// the query builder.
+    /// the query builder. An operation the database cannot do, or an alter-only command such as
+    /// `rename_column` inside `create`, is [`Error::Unsupported`].
     pub fn try_to_sql(&self, driver: Driver) -> Result<Vec<String>, Error> {
         let dialect = Dialect::of(driver);
         match &self.kind {
-            Kind::Create { table, blueprint } => blueprint.render(driver, dialect, table),
+            Kind::Create {
+                table,
+                blueprint,
+                if_not_exists,
+            } => blueprint.render_create(driver, dialect, table, *if_not_exists),
+            Kind::Alter { table, blueprint } => blueprint.render_alter(driver, dialect, table),
             Kind::Drop { table, if_exists } => {
                 crate::query::validate(table)?;
                 let exists = if *if_exists { "IF EXISTS " } else { "" };

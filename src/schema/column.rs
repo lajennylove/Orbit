@@ -14,13 +14,15 @@ pub(crate) enum ColumnType {
     DateTime,
 }
 
-/// A column of a table being created. Chain `nullable`, `default` and `length` on it.
+/// A column of a table being created or changed. Chain `nullable`, `default`, `length` and
+/// `change` on it.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub(crate) name: String,
     pub(crate) ty: ColumnType,
     nullable: bool,
     default: Option<Value>,
+    pub(crate) change: bool,
 }
 
 impl Column {
@@ -30,6 +32,7 @@ impl Column {
             ty,
             nullable: false,
             default: None,
+            change: false,
         }
     }
 
@@ -53,6 +56,15 @@ impl Column {
         self
     }
 
+    /// Modifies this existing column instead of adding it, as Laravel's `->change()`. It only
+    /// works inside [`schema::table`](super::table): the column takes the type, nullability and
+    /// default described here. SQLite cannot change a column in place, so rendering it there is
+    /// [`Error::Unsupported`]; so is changing an `id` column.
+    pub fn change(&mut self) -> &mut Self {
+        self.change = true;
+        self
+    }
+
     /// The column's SQL: its quoted name, type, nullability and default.
     pub(crate) fn render(&self, driver: Driver, dialect: Dialect) -> Result<String, Error> {
         crate::query::validate(&self.name)?;
@@ -73,6 +85,27 @@ impl Column {
             sql.push_str(&literal(value, driver, dialect)?);
         }
         Ok(sql)
+    }
+
+    /// The PostgreSQL clauses that change this column to its description: its type, then its
+    /// nullability, then its default, comma-separated for one `ALTER TABLE`.
+    pub(crate) fn render_change_postgres(&self, driver: Driver) -> Result<String, Error> {
+        crate::query::validate(&self.name)?;
+        let name = driver.quote(&self.name);
+        let ty = self.sql_type(Dialect::Postgres);
+        let null = if self.nullable {
+            "DROP NOT NULL"
+        } else {
+            "SET NOT NULL"
+        };
+        let default = match &self.default {
+            Some(value) => format!("SET DEFAULT {}", literal(value, driver, Dialect::Postgres)?),
+            None => "DROP DEFAULT".to_owned(),
+        };
+        Ok(format!(
+            "ALTER COLUMN {name} TYPE {ty}, ALTER COLUMN {name} {null}, \
+             ALTER COLUMN {name} {default}"
+        ))
     }
 
     fn sql_type(&self, dialect: Dialect) -> String {
